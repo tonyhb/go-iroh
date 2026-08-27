@@ -197,7 +197,7 @@ func (s *publisherService) run(ctx context.Context) {
 }
 
 func (s *publisherService) publishCurrent(ctx context.Context, info dns.EndpointInfo) error {
-	packet, err := info.ToPkarrSignedPacket(s.secretKey, s.ttl)
+	packet, err := info.ToSignedPacket(s.secretKey, s.ttl)
 	if err != nil {
 		return fmt.Errorf("encode signed packet: %w", err)
 	}
@@ -264,7 +264,7 @@ func (r *PkarrResolver) Resolve(ctx context.Context, id key.EndpointID) iter.Seq
 			}
 			return
 		}
-		info, err := dns.EndpointInfoFromPkarrSignedPacket(packet)
+		info, err := dns.EndpointInfoFromSignedPacket(packet)
 		if err != nil {
 			if ctx.Err() == nil {
 				yield(Item{}, lookupErr(PkarrProvenance, err))

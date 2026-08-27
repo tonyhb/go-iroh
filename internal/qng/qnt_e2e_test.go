@@ -120,6 +120,16 @@ func waitForQNTRoutePath(t *testing.T, ctx context.Context, c *Conn, want netip.
 	}
 }
 
+// waitForQNTPathRTT waits for an application-data RTT sample on path id,
+// sending a fresh datagram on that path each round.
+//
+// Resending is what makes this terminate. A sample is only taken when the
+// largest newly acknowledged packet is not a path probe, so an ACK whose
+// largest acked is a QNT probe yields none — and on a freshly validated path
+// the probe can easily carry the higher packet number. Since nothing else is
+// sent on the path afterwards, a single datagram leaves the path permanently
+// without an RTT rather than merely slow to acquire one. Each round offers
+// another non-probe candidate.
 func waitForQNTPathRTT(t *testing.T, ctx context.Context, c *Conn, id protocol.PathID) PathInfo {
 	t.Helper()
 	for {
@@ -128,6 +138,9 @@ func waitForQNTPathRTT(t *testing.T, ctx context.Context, c *Conn, id protocol.P
 			if p.ID == id && p.HasRTT {
 				return p
 			}
+		}
+		if err := c.SendDatagramOnPath(id, []byte("qnt-route-rtt-probe")); err != nil {
+			t.Fatalf("client SendDatagramOnPath(%d): %v", id, err)
 		}
 		select {
 		case <-ctx.Done():

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tmc/go-iroh/dns"
+	itls "github.com/tmc/go-iroh/internal/itls/tls"
 	"github.com/tmc/go-iroh/internal/netreport"
 	"github.com/tmc/go-iroh/internal/portmapper"
 	quic "github.com/tmc/go-iroh/internal/qng"
@@ -41,6 +42,7 @@ type Endpoint struct {
 	listener     *quic.EarlyListener
 	quicConf     *quic.Config
 	keyLogWriter io.Writer
+	keyExchange  KeyExchangePolicy
 	sessionCache *SessionCache
 	disableIP    bool
 	relayFirst   bool
@@ -60,12 +62,17 @@ type Endpoint struct {
 	closedCh    chan struct{}
 	acceptOwner acceptOwner
 	addrWatch   *watch.Value[netaddr.EndpointAddr]
-	externalNAT []netip.AddrPort
-	netReport   netReportRunner
-	lastReport  *NetReport
-	nextStable  uint64
-	stableIDs   map[*quic.Conn]uint64
-	metrics     endpointMetrics
+	// externalPinned holds addresses pinned via AddExternalAddr until
+	// RemoveExternalAddr. externalDiscovered holds the latest net report's
+	// reflexive addresses, replaced wholesale per report. Kept apart so a
+	// report cannot drop pinned candidates, nor pinning keep stale ones.
+	externalPinned     []netip.AddrPort
+	externalDiscovered []netip.AddrPort
+	netReport          netReportRunner
+	lastReport         *NetReport
+	nextStable         uint64
+	stableIDs          map[*quic.Conn]uint64
+	metrics            endpointMetrics
 }
 
 type acceptOwner int
@@ -95,6 +102,7 @@ type config struct {
 	natPMPGateway   netip.Addr
 	natPMPPort      uint16
 	keyLogWriter    io.Writer
+	keyExchange     KeyExchangePolicy
 	transportConfig *QUICTransportConfig
 	pathSelector    socket.PathSelector
 	relayFirst      bool
@@ -127,6 +135,11 @@ type BindOpts struct {
 type QUICTransportConfig struct {
 	KeepAlivePeriod time.Duration
 	MaxIdleTimeout  time.Duration
+	// InitialPacketSize is the initial QUIC packet size in bytes.
+	InitialPacketSize uint16
+	// MaxIncomingStreams is the maximum number of concurrent bidirectional
+	// streams accepted from a peer.
+	MaxIncomingStreams int64
 }
 
 // WithSecretKey sets the endpoint's identity. If unset, [Bind] generates a
@@ -313,6 +326,18 @@ func WithKeyLogWriter(w io.Writer) Option {
 	}
 }
 
+// WithKeyExchangePolicy selects the TLS key-exchange groups used for direct
+// peer connections. The zero policy keeps the package default.
+func WithKeyExchangePolicy(policy KeyExchangePolicy) Option {
+	return func(c *config) error {
+		if !policy.valid() {
+			return fmt.Errorf("iroh: invalid key exchange policy %d", policy)
+		}
+		c.keyExchange = policy
+		return nil
+	}
+}
+
 // WithHooks registers endpoint hooks. Hooks run in registration order and may
 // reject outgoing dials or completed handshakes.
 func WithHooks(h EndpointHooks) Option {
@@ -414,6 +439,12 @@ func Bind(ctx context.Context, opts ...Option) (*Endpoint, error) {
 		if c.transportConfig.MaxIdleTimeout != 0 {
 			quicConf.MaxIdleTimeout = c.transportConfig.MaxIdleTimeout
 		}
+		if c.transportConfig.InitialPacketSize != 0 {
+			quicConf.InitialPacketSize = c.transportConfig.InitialPacketSize
+		}
+		if c.transportConfig.MaxIncomingStreams != 0 {
+			quicConf.MaxIncomingStreams = c.transportConfig.MaxIncomingStreams
+		}
 	}
 	// The QUIC transport is driven over the magic socket rather than the raw
 	// UDP socket: a single net.PacketConn that multiplexes every iroh path. The
@@ -455,6 +486,7 @@ func Bind(ctx context.Context, opts ...Option) (*Endpoint, error) {
 		},
 		quicConf:     quicConf,
 		keyLogWriter: c.keyLogWriter,
+		keyExchange:  c.keyExchange,
 		sessionCache: NewSessionCache(),
 		// A nil udp means there is no IP transport (relay-only bind, or the js
 		// build where bindPacketConn never returns a socket), so IP addresses
@@ -466,14 +498,25 @@ func Bind(ctx context.Context, opts ...Option) (*Endpoint, error) {
 		custom:       append([]CustomTransport(nil), c.custom...),
 		lookup:       c.lookup,
 		closedCh:     make(chan struct{}),
-		netReport:    endpointNetReportRunner(c, relayMap),
 		stableIDs:    make(map[*quic.Conn]uint64),
 	}
+	// Assigned after the literal: the runner needs ep.transport so QAD
+	// probes ride the endpoint's own socket (see qadDialer).
+	ep.netReport = endpointNetReportRunner(c, relayMap, ep.qadDialer())
 	// The per-remote state registry shares the serve context: its actors stop
 	// when the endpoint's recv loop stops. Its resolve hook is backed by the
 	// endpoint's address-lookup services (slice G), passed down as a func value
 	// so internal/socket does not import iroh.
 	ep.remotes = socket.NewRemoteMapWithMetrics(serveCtx, c.pathSelector, ep.resolveFunc(), magic.MetricsSet())
+	if ep.disableIP {
+		// No IP transports: upgrade-tick hole punching has nothing to punch
+		// toward and wedges in-flight relay streams (perflab: relay-forced
+		// transfers stall at the 60 s upgrade tick).
+		ep.remotes.DisableHolepunch()
+	}
+	// Reaped remotes release their mapped addresses, so the socket's tables do
+	// not grow without bound under peer churn (upstream iroh issue #4293).
+	ep.remotes.SetOnEvict(sock.EvictRemote)
 	ep.magic.SetEndpointSender(func(id key.EndpointID, p []byte) bool {
 		err := ep.remotes.Actor(id).SendDatagram(p, func(addr socket.Addr, data []byte) bool {
 			return ep.magic.SendAddr(addr, data)
@@ -522,7 +565,7 @@ func (e *Endpoint) sourceAddressValidation() func(net.Addr) bool {
 	return e.verifySource
 }
 
-func endpointNetReportRunner(c config, relayMap *relay.Map) netReportRunner {
+func endpointNetReportRunner(c config, relayMap *relay.Map, dialer netreport.QADDialer) netReportRunner {
 	if c.netReport != nil {
 		return c.netReport
 	}
@@ -530,8 +573,25 @@ func endpointNetReportRunner(c config, relayMap *relay.Map) netReportRunner {
 		return nil
 	}
 	client := netreport.NewClient(relayMap)
+	if dialer != nil {
+		client = client.WithQADDialer(dialer)
+	}
 	return func(ctx context.Context) (*netreport.Report, error) {
 		return client.GetReport(ctx, netreport.IfStateDetails{HaveV4: true, HaveV6: true}, false)
+	}
+}
+
+// qadDialer returns the dialer net_report uses for QAD probes. Dials on the
+// endpoint's own transport share its UDP socket, so the address a relay
+// observes is the endpoint's real public mapping — a usable dial and
+// hole-punch candidate. Nil when there is no IP transport; net_report then
+// falls back to a private per-probe socket.
+func (e *Endpoint) qadDialer() netreport.QADDialer {
+	if e.udp == nil {
+		return nil
+	}
+	return func(ctx context.Context, addr netip.AddrPort, tlsConf *itls.Config, cfg *quic.Config) (*quic.Conn, error) {
+		return e.transport.Dial(ctx, net.UDPAddrFromAddrPort(addr), tlsConf, cfg)
 	}
 }
 
@@ -549,7 +609,7 @@ func maxRemoteNATTraversalAddresses() *uint8 {
 // It uses an early listener so the QUIC stack can accept 0-RTT early data from
 // peers that resume a prior session.
 func (e *Endpoint) startListener() error {
-	serverTLS, err := serverTLSConfig(e.secretKey, e.alpns)
+	serverTLS, err := serverTLSConfigWithCurves(e.secretKey, e.alpns, e.keyExchange.curves())
 	if err != nil {
 		return err
 	}
@@ -615,6 +675,16 @@ func (e *Endpoint) LocalAddr() netip.AddrPort {
 	return e.udp.LocalAddr().(*net.UDPAddr).AddrPort()
 }
 
+// externalNATLocked returns the pinned and net-report-discovered external
+// candidates, pinned first, deduplicated. e.mu must be held.
+func (e *Endpoint) externalNATLocked() []netip.AddrPort {
+	out := append([]netip.AddrPort(nil), e.externalPinned...)
+	for _, addr := range e.externalDiscovered {
+		out = appendUniqueNATTraversalCandidate(out, addr)
+	}
+	return out
+}
+
 // localNATTraversalCandidates returns concrete local direct addresses this
 // endpoint can hand to qng's QNT state. The default bind address is unspecified
 // ([::]:port), which is not a usable candidate and must not be advertised.
@@ -629,7 +699,7 @@ func (e *Endpoint) localNATTraversalCandidates() []netip.AddrPort {
 		addrs = appendUniqueNATTraversalCandidate(addrs, addr)
 	}
 	e.mu.Lock()
-	external := append([]netip.AddrPort(nil), e.externalNAT...)
+	external := e.externalNATLocked()
 	e.mu.Unlock()
 	for _, addr := range external {
 		addrs = appendUniqueNATTraversalCandidate(addrs, addr)
@@ -637,6 +707,9 @@ func (e *Endpoint) localNATTraversalCandidates() []netip.AddrPort {
 	return addrs
 }
 
+// setExternalNATTraversalCandidates replaces the discovered external
+// candidate set: net reports are authoritative, and replacement retires
+// mappings the NAT rebound. Pinned addresses are a separate set.
 func (e *Endpoint) setExternalNATTraversalCandidates(addrs ...netip.AddrPort) bool {
 	var next []netip.AddrPort
 	for _, addr := range addrs {
@@ -644,11 +717,11 @@ func (e *Endpoint) setExternalNATTraversalCandidates(addrs ...netip.AddrPort) bo
 	}
 
 	e.mu.Lock()
-	if equalAddrPorts(e.externalNAT, next) {
+	if equalAddrPorts(e.externalDiscovered, next) {
 		e.mu.Unlock()
 		return false
 	}
-	e.externalNAT = next
+	e.externalDiscovered = next
 	e.updateAddrWatchLocked()
 	e.mu.Unlock()
 
@@ -656,20 +729,20 @@ func (e *Endpoint) setExternalNATTraversalCandidates(addrs ...netip.AddrPort) bo
 	return true
 }
 
-// AddExternalAddr adds addr to the endpoint's externally reachable addresses
-// and advertises it as a QNT NAT traversal candidate. Invalid, unspecified, or
-// zero-port addresses are ignored.
+// AddExternalAddr pins addr as an externally reachable address and advertises
+// it as a QNT NAT traversal candidate until RemoveExternalAddr; net reports
+// never drop it. Invalid, unspecified, or zero-port addresses are ignored.
 func (e *Endpoint) AddExternalAddr(addr netip.AddrPort) {
 	if e.disableIP {
 		return
 	}
 	e.mu.Lock()
-	next := appendUniqueNATTraversalCandidate(append([]netip.AddrPort(nil), e.externalNAT...), addr)
-	if equalAddrPorts(e.externalNAT, next) {
+	next := appendUniqueNATTraversalCandidate(append([]netip.AddrPort(nil), e.externalPinned...), addr)
+	if equalAddrPorts(e.externalPinned, next) {
 		e.mu.Unlock()
 		return
 	}
-	e.externalNAT = next
+	e.externalPinned = next
 	e.updateAddrWatchLocked()
 	e.mu.Unlock()
 	e.advertiseNATTraversalCandidates()
@@ -689,12 +762,12 @@ func (e *Endpoint) RemoveExternalAddr(addr netip.AddrPort) bool {
 	}
 
 	e.mu.Lock()
-	i := slices.Index(e.externalNAT, addr)
+	i := slices.Index(e.externalPinned, addr)
 	if i < 0 {
 		e.mu.Unlock()
 		return false
 	}
-	e.externalNAT = slices.Delete(e.externalNAT, i, i+1)
+	e.externalPinned = slices.Delete(e.externalPinned, i, i+1)
 	e.updateAddrWatchLocked()
 	e.mu.Unlock()
 	e.advertiseNATTraversalCandidates()
@@ -889,10 +962,17 @@ func equalAddrPorts(a, b []netip.AddrPort) bool {
 func (e *Endpoint) Addr() netaddr.EndpointAddr {
 	a := netaddr.NewEndpointAddr(e.ID())
 	if !e.disableIP {
-		a = a.WithIP(e.LocalAddr())
+		// The bind address is unspecified ([::]:port) unless the caller chose
+		// one, and that is not something a peer can dial: it means "every
+		// interface on that host". Advertising it gives peers a target that
+		// resolves to their own loopback, and it makes NAT traversal probes
+		// arrive from a source the connection does not recognize.
+		if addr, ok := canonicalNATTraversalCandidate(e.LocalAddr()); ok {
+			a = a.WithIP(addr)
+		}
 	}
 	e.mu.Lock()
-	external := append([]netip.AddrPort(nil), e.externalNAT...)
+	external := e.externalNATLocked()
 	e.mu.Unlock()
 	if !e.disableIP {
 		for _, addr := range external {
@@ -934,8 +1014,10 @@ func endpointAddrEqual(a, b netaddr.EndpointAddr) bool {
 func (e *Endpoint) addrLocked() netaddr.EndpointAddr {
 	a := netaddr.NewEndpointAddr(e.ID())
 	if !e.disableIP {
-		a = a.WithIP(e.LocalAddr())
-		for _, addr := range e.externalNAT {
+		if addr, ok := canonicalNATTraversalCandidate(e.LocalAddr()); ok {
+			a = a.WithIP(addr)
+		}
+		for _, addr := range e.externalNATLocked() {
 			a = a.WithIP(addr)
 		}
 	}
@@ -1158,7 +1240,7 @@ func (e *Endpoint) connectEarly(ctx context.Context, addr netaddr.EndpointAddr, 
 		return nil, ErrNoAddress
 	}
 
-	clientTLS, err := clientTLSConfig(e.secretKey, addr.ID, []string{alpn}, e.sessionCache)
+	clientTLS, err := clientTLSConfigWithCurves(e.secretKey, addr.ID, []string{alpn}, e.sessionCache, e.keyExchange.curves())
 	if err != nil {
 		return nil, err
 	}
@@ -1414,9 +1496,18 @@ func (e *Endpoint) registerConn(remote key.EndpointID, qc *quic.Conn, remoteAddr
 	// hole-punch calls.
 	_ = actor.AddNATTraversalAddresses(e.localNATTraversalCandidates())
 	_ = actor.AddRemoteNATTraversalAddresses(remoteAddr.IPAddrs())
-	if len(remoteAddr.IPAddrs()) != 0 {
-		_ = actor.TriggerHolepunch()
-	}
+	// Punch as soon as a remote candidate is known instead of waiting for
+	// the 60s upgrade tick: immediately when the dial carried IP addresses
+	// (the seed above closed the channel), or when the server's first
+	// ADD_ADDRESS lands after a relay-won dial. The server side of QNT
+	// receives no ADD_ADDRESS and parks here until the connection closes.
+	go func() {
+		select {
+		case <-qc.NATTraversalRemoteAddrsReady():
+			_ = actor.TriggerHolepunchConn(adapter)
+		case <-qc.Context().Done():
+		}
+	}()
 	return actor, adapter
 }
 

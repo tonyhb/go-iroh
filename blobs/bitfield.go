@@ -149,6 +149,9 @@ func decodeChunkRangesBoundaries(p *parser) (ChunkRanges, error) {
 	if err != nil {
 		return ChunkRanges{}, wrapDecodeErr(err)
 	}
+	if n > uint64(len(p.b)-p.off) {
+		return ChunkRanges{}, wrapDecodeErr(endpointticket.ErrTruncated)
+	}
 	bounds := make([]uint64, 0, n)
 	for range n {
 		bound, err := p.varint()

@@ -216,7 +216,14 @@ func (h *Handler) contentStatus() func(SignedEntry) ContentStatus {
 		return h.ContentStatus
 	}
 	return func(entry SignedEntry) ContentStatus {
-		switch blobs.Status(h.BlobStore, entry.Entry.ContentHash()).State {
+		// ContentStatus carries no context of its own, so this is the boundary
+		// where one has to be supplied. Threading a caller's context through
+		// the callback is a docs API change worth making on its own.
+		status, err := blobs.Status(context.Background(), h.BlobStore, entry.Entry.ContentHash())
+		if err != nil {
+			return ContentMissing
+		}
+		switch status.State {
 		case blobs.BlobComplete:
 			return ContentComplete
 		case blobs.BlobPartial:

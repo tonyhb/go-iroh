@@ -73,6 +73,80 @@ func TestServerPutRejectsBadPacket(t *testing.T) {
 	}
 }
 
+func TestServerPutRejectsStalePacket(t *testing.T) {
+	sk, old := testPacketWithData(t, testSecretKey(t), "old")
+	_, newer := testPacketWithData(t, sk, "new")
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	keyLabel := sk.Public().EndpointID().Z32()
+	putPacket(t, ts, keyLabel, newer, http.StatusNoContent)
+	putPacket(t, ts, keyLabel, old, http.StatusConflict)
+
+	resp, err := ts.Client().Get(ts.URL + "/pkarr/" + keyLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newer.RelayPayload()) {
+		t.Fatalf("GET body = %x, want newer packet %x", got, newer.RelayPayload())
+	}
+}
+
+func TestServerPutRejectsExpiredPacket(t *testing.T) {
+	sk, packet := testPacket(t)
+	srv := New()
+	now := time.UnixMicro(int64(packet.TimestampMicros())).Add(packetRetention + time.Microsecond)
+	srv.now = func() time.Time { return now }
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	keyLabel := sk.Public().EndpointID().Z32()
+	putPacket(t, ts, keyLabel, packet, http.StatusConflict)
+	if _, ok := srv.get(keyLabel); ok {
+		t.Fatal("expired packet was stored")
+	}
+}
+
+func TestServerEvictsStoredPackets(t *testing.T) {
+	now := time.Unix(1, 0)
+	srv := New()
+	srv.maxPackets = 2
+	srv.retention = time.Hour
+	srv.now = func() time.Time { return now }
+
+	var keys []string
+	for i := range 3 {
+		var seed [32]byte
+		seed[0] = byte(i + 1)
+		sk, packet := testPacketWithData(t, key.NewSecretKey(seed), "hello")
+		keyLabel := sk.Public().EndpointID().Z32()
+		keys = append(keys, keyLabel)
+		if !srv.put(keyLabel, packet.RelayPayload(), packet) {
+			t.Fatal("put rejected a new packet")
+		}
+		now = now.Add(time.Second)
+	}
+	if _, ok := srv.get(keys[0]); ok {
+		t.Fatal("oldest packet was not evicted")
+	}
+	for _, keyLabel := range keys[1:] {
+		if _, ok := srv.get(keyLabel); !ok {
+			t.Fatalf("packet %q was evicted", keyLabel)
+		}
+	}
+
+	now = now.Add(time.Hour)
+	if _, ok := srv.get(keys[2]); ok {
+		t.Fatal("expired packet was not evicted")
+	}
+}
+
 func TestServeDNSPacket(t *testing.T) {
 	sk, packet := testPacket(t)
 	srv := New()
@@ -139,11 +213,21 @@ func TestServePacketConn(t *testing.T) {
 
 func testPacket(t *testing.T) (key.SecretKey, *dns.SignedPacket) {
 	t.Helper()
+	return testPacketWithData(t, testSecretKey(t), "hello")
+}
+
+func testSecretKey(t *testing.T) key.SecretKey {
+	t.Helper()
 	sk, err := key.ParseSecretKey("vpnk377obfvzlipnsfbqba7ywkkenc4xlpmovt5tsfujoa75zqia")
 	if err != nil {
 		t.Fatal(err)
 	}
-	userData, err := dns.NewUserData("hello")
+	return sk
+}
+
+func testPacketWithData(t *testing.T, sk key.SecretKey, data string) (key.SecretKey, *dns.SignedPacket) {
+	t.Helper()
+	userData, err := dns.NewUserData(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,9 +246,25 @@ func (s *Server) storePacket(t *testing.T, sk key.SecretKey, packet *dns.SignedP
 	if _, err := packetFromRelayPayload(keyLabel, packet.RelayPayload()); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Lock()
-	s.store[keyLabel] = packet.RelayPayload()
-	s.mu.Unlock()
+	if !s.put(keyLabel, packet.RelayPayload(), packet) {
+		t.Fatal("storePacket rejected packet")
+	}
+}
+
+func putPacket(t *testing.T, ts *httptest.Server, keyLabel string, packet *dns.SignedPacket, wantStatus int) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/pkarr/"+keyLabel, bytes.NewReader(packet.RelayPayload()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("PUT status = %d, want %d", resp.StatusCode, wantStatus)
+	}
 }
 
 func packTXTQuery(t *testing.T, name string) []byte {
@@ -223,9 +323,7 @@ func unpackTXTResponse(t *testing.T, msg []byte) []string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, s := range txt.TXT {
-			out = append(out, s)
-		}
+		out = append(out, txt.TXT...)
 	}
 	return out
 }

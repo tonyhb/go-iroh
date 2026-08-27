@@ -154,3 +154,87 @@ func TestReceiveStreamFinAfterInOrderFrame(t *testing.T) {
 		t.Fatalf("Read = %d, %q; want 1, a", n, buf[:n])
 	}
 }
+
+type receiveStreamCompletionSender struct {
+	completed chan protocol.StreamID
+}
+
+func (receiveStreamCompletionSender) onHasConnectionData()                           {}
+func (receiveStreamCompletionSender) onHasStreamData(protocol.StreamID, *SendStream) {}
+func (receiveStreamCompletionSender) onHasStreamControlFrame(protocol.StreamID, streamControlFrameGetter) {
+}
+func (s receiveStreamCompletionSender) onStreamCompleted(id protocol.StreamID) {
+	select {
+	case s.completed <- id:
+	default:
+	}
+}
+
+// A FIN that arrives with no new readable bytes while the reader is parked in
+// Read must still complete the stream: completion is what deletes the stream
+// from the incoming streams map and grants the peer MAX_STREAMS credit, so a
+// missed completion permanently leaks a stream slot.
+func TestReceiveStreamLateFinWhileBlockedCompletesStream(t *testing.T) {
+	sender := receiveStreamCompletionSender{completed: make(chan protocol.StreamID, 1)}
+	s := newReceiveStream(0, sender, receiveStreamTestFlow{})
+
+	if err := s.handleStreamFrame(&wire.StreamFrame{StreamID: 0, Data: []byte("a")}, monotime.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	if n, err := s.Read(buf[:]); n != 1 || err != nil {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		var b [1]byte
+		_, err := s.Read(b[:])
+		readErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the reader park in Read
+
+	// The FIN arrives late, carrying no new data (retransmission after the
+	// reader drained the stream).
+	if err := s.handleStreamFrame(&wire.StreamFrame{StreamID: 0, Offset: 1, Fin: true}, monotime.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-readErr:
+		if err != io.EOF {
+			t.Fatalf("Read err = %v, want io.EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read did not return")
+	}
+	select {
+	case <-sender.completed:
+	case <-time.After(time.Second):
+		t.Fatal("stream never completed: MAX_STREAMS credit is never granted")
+	}
+}
+
+// Control case: the same late FIN with the reader not parked.
+func TestReceiveStreamLateFinCompletesStream(t *testing.T) {
+	sender := receiveStreamCompletionSender{completed: make(chan protocol.StreamID, 1)}
+	s := newReceiveStream(0, sender, receiveStreamTestFlow{})
+	if err := s.handleStreamFrame(&wire.StreamFrame{StreamID: 0, Data: []byte("a")}, monotime.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	if n, err := s.Read(buf[:]); n != 1 || err != nil {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	if err := s.handleStreamFrame(&wire.StreamFrame{StreamID: 0, Offset: 1, Fin: true}, monotime.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Read(buf[:]); err != io.EOF {
+		t.Fatalf("Read err = %v, want io.EOF", err)
+	}
+	select {
+	case <-sender.completed:
+	case <-time.After(time.Second):
+		t.Fatal("stream never completed")
+	}
+}

@@ -31,6 +31,7 @@ func TestTimeoutError(t *testing.T) {
 	if !ne.Timeout() {
 		t.Error("Timeout() = false, want true")
 	}
+	//lint:ignore SA1019 This test pins the legacy method required by quic-go.
 	if !ne.Temporary() {
 		t.Error("Temporary() = false, want true")
 	}

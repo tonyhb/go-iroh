@@ -48,7 +48,10 @@ type connIDGenerator struct {
 	highestSeq  uint64
 	connRunners connRunners
 
-	activeSrcConnIDs        map[uint64]protocol.ConnectionID
+	activeSrcConnIDs map[uint64]protocol.ConnectionID
+	// cidPath indexes every issued source connection ID by the path it
+	// belongs to, for per-packet lookup in pathForLocalConnID.
+	cidPath                 map[protocol.ConnectionID]protocol.PathID
 	connIDsToRetire         []connIDToRetire       // sorted by t
 	initialClientDestConnID *protocol.ConnectionID // nil for the client
 
@@ -80,12 +83,17 @@ func newConnIDGenerator(
 	m := &connIDGenerator{
 		generator:         generator,
 		activeSrcConnIDs:  make(map[uint64]protocol.ConnectionID),
+		cidPath:           make(map[protocol.ConnectionID]protocol.PathID),
 		statelessResetter: statelessResetter,
 		connRunners:       map[connRunner]connRunnerCallbacks{runner: callbacks},
 		queueControlFrame: queueControlFrame,
 	}
 	m.activeSrcConnIDs[0] = initialConnectionID
+	m.cidPath[initialConnectionID] = protocol.PathIDZero
 	m.initialClientDestConnID = initialClientDestConnID
+	if initialClientDestConnID != nil {
+		m.cidPath[*initialClientDestConnID] = protocol.PathIDZero
+	}
 	return m
 }
 
@@ -128,6 +136,7 @@ func (m *connIDGenerator) Retire(seq uint64, sentWithDestConnID protocol.Connect
 	m.queueConnIDForRetiring(connID, expiry)
 
 	delete(m.activeSrcConnIDs, seq)
+	delete(m.cidPath, connID)
 	// Don't issue a replacement for the initial connection ID.
 	if seq == 0 {
 		return nil
@@ -163,6 +172,7 @@ func (m *connIDGenerator) RetirePath(pid protocol.PathID, seq uint64, sentWithDe
 	}
 	m.queueConnIDForRetiring(connID, expiry)
 	delete(ids, seq)
+	delete(m.cidPath, connID)
 	if len(ids) == 0 {
 		delete(m.pathSrcConnIDs, pid)
 	}
@@ -186,6 +196,7 @@ func (m *connIDGenerator) issueNewConnID() error {
 		return err
 	}
 	m.activeSrcConnIDs[m.highestSeq+1] = connID
+	m.cidPath[connID] = protocol.PathIDZero
 	m.connRunners.AddConnectionID(connID)
 	m.queueControlFrame(&wire.NewConnectionIDFrame{
 		SequenceNumber:      m.highestSeq + 1,
@@ -230,6 +241,7 @@ func (m *connIDGenerator) issuePathConnID(pid protocol.PathID) (protocol.Connect
 	}
 	seq := m.pathHighestSeq[pid]
 	ids[seq] = connID
+	m.cidPath[connID] = pid
 	m.pathHighestSeq[pid] = seq + 1
 	m.connRunners.AddConnectionID(connID)
 	pidCopy := pid
@@ -249,27 +261,14 @@ func (m *connIDGenerator) issuePathConnID(pid protocol.PathID) (protocol.Connect
 // one of our CIDs) to the path it belongs to, so the packet is acked as a
 // PATH_ACK{pid}. ok is false for a CID we never issued.
 func (m *connIDGenerator) pathForLocalConnID(connID protocol.ConnectionID) (protocol.PathID, bool) {
-	for _, id := range m.activeSrcConnIDs {
-		if id == connID {
-			return protocol.PathIDZero, true
-		}
-	}
-	if m.initialClientDestConnID != nil && *m.initialClientDestConnID == connID {
-		return protocol.PathIDZero, true
-	}
-	for pid, ids := range m.pathSrcConnIDs {
-		for _, id := range ids {
-			if id == connID {
-				return pid, true
-			}
-		}
-	}
-	return protocol.PathIDZero, false
+	pid, ok := m.cidPath[connID]
+	return pid, ok
 }
 
 func (m *connIDGenerator) SetHandshakeComplete(connIDExpiry monotime.Time) {
 	if m.initialClientDestConnID != nil {
 		m.queueConnIDForRetiring(*m.initialClientDestConnID, connIDExpiry)
+		delete(m.cidPath, *m.initialClientDestConnID)
 		m.initialClientDestConnID = nil
 	}
 }

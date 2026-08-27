@@ -45,27 +45,10 @@ func relayURL(t *testing.T, s string) netaddr.RelayURL {
 	return u
 }
 
-func endpointInfoWithRelay(id key.EndpointID, relay netaddr.RelayURL) dns.EndpointInfo {
-	return dns.EndpointInfo{
-		ID:   id,
-		Data: dns.NewEndpointData(netaddr.RelayAddr{URL: relay}),
-	}
-}
-
 func endpointInfoWithIP(id key.EndpointID, ip netip.AddrPort) dns.EndpointInfo {
 	return dns.EndpointInfo{
 		ID:   id,
 		Data: dns.NewEndpointData(netaddr.IPAddr{Addr: ip}),
-	}
-}
-
-func endpointInfoWithRelayAndIP(id key.EndpointID, relay netaddr.RelayURL, ip netip.AddrPort) dns.EndpointInfo {
-	return dns.EndpointInfo{
-		ID: id,
-		Data: dns.NewEndpointData(
-			netaddr.RelayAddr{URL: relay},
-			netaddr.IPAddr{Addr: ip},
-		),
 	}
 }
 

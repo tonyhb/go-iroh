@@ -9,19 +9,16 @@ import (
 	"lukechampine.com/blake3/bao"
 )
 
-func TestBytesMapEntry(t *testing.T) {
+func TestMemStoreEntry(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), BlockSize+17)
-	m, err := NewBytesMap(data)
+	m, err := NewMemStore(data)
 	if err != nil {
-		t.Fatalf("NewBytesMap: %v", err)
+		t.Fatalf("NewMemStore: %v", err)
 	}
 	hash := NewHash(data)
-	entry, ok, err := m.Get(context.Background(), hash)
+	entry, err := m.Open(context.Background(), hash)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
-	}
-	if !ok {
-		t.Fatal("Get = false, want true")
 	}
 	if got := entry.Hash(); got != hash {
 		t.Fatalf("Hash = %s, want %s", got, hash)
@@ -60,14 +57,14 @@ func TestBytesMapEntry(t *testing.T) {
 
 func TestMapStoreServesBlob(t *testing.T) {
 	data := []byte("provider map store")
-	m, err := NewBytesMap(data)
+	m, err := NewMemStore(data)
 	if err != nil {
-		t.Fatalf("NewBytesMap: %v", err)
+		t.Fatalf("NewMemStore: %v", err)
 	}
 	hash := NewHash(data)
-	got, ok := m.Store().GetBlob(hash)
-	if !ok {
-		t.Fatal("GetBlob = false, want true")
+	got, err := ReadBlob(context.Background(), m, hash)
+	if err != nil {
+		t.Fatalf("ReadBlob: %v", err)
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("GetBlob = %q, want %q", got, data)
@@ -76,7 +73,7 @@ func TestMapStoreServesBlob(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, m.Store())
+		errc <- ServeBlob(context.Background(), server, m)
 	}()
 	got, err = GetBlobBytes(context.Background(), client, hash)
 	if err != nil {
@@ -90,14 +87,14 @@ func TestMapStoreServesBlob(t *testing.T) {
 	}
 }
 
-func TestBytesMapHonorsCanceledContext(t *testing.T) {
-	m, err := NewBytesMap([]byte("x"))
+func TestMemStoreHonorsCanceledContext(t *testing.T) {
+	m, err := NewMemStore([]byte("x"))
 	if err != nil {
-		t.Fatalf("NewBytesMap: %v", err)
+		t.Fatalf("NewMemStore: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, err := m.Get(ctx, NewHash([]byte("x"))); err == nil {
+	if _, err := m.Open(ctx, NewHash([]byte("x"))); err == nil {
 		t.Fatal("Get canceled context error = nil")
 	}
 }

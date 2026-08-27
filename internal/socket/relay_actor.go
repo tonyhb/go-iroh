@@ -6,6 +6,7 @@ import (
 	"errors"
 	mrand "math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tmc/go-iroh/internal/relayclient"
@@ -180,12 +181,23 @@ type RelayActor struct {
 	sendCh  chan RelaySendItem
 	homeURL *watch.Value[*RelayStatus]
 
+	// metrics is the shared magic-socket counter set, or nil. It is set by the
+	// owning MagicConn before the actor runs.
+	metrics atomic.Pointer[Metrics]
+
 	mu     sync.Mutex
 	active map[string]*activeRelay // key: RelayURL.String()
 	home   netaddr.RelayURL
 	closed bool
 
 	wg sync.WaitGroup
+}
+
+// setMetrics records the counter set frame handlers report into.
+func (a *RelayActor) setMetrics(m *Metrics) {
+	if a != nil {
+		a.metrics.Store(m)
+	}
 }
 
 // NewRelayActor returns a RelayActor ready to be started with [RelayActor.Run].
@@ -459,6 +471,7 @@ type activeRelay struct {
 	url    netaddr.RelayURL
 
 	sendCh   chan RelaySendItem
+	batchBuf []byte
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
@@ -798,18 +811,60 @@ func pingTimeoutDuration(st *connectedState) time.Duration {
 	return relayPingTimeoutMax
 }
 
-// sendDatagrams sends a batch of queued datagrams as client-to-relay datagram
-// frames, one frame per item (each item already carries its own batch encoding).
+// sendDatagrams merges runs of equally sized datagrams to one endpoint into
+// DatagramBatch frames, like the GSO batches the Rust client sends.
 func (r *activeRelay) sendDatagrams(client relayClient, items []RelaySendItem) error {
-	for _, it := range items {
-		err := r.send(client, relayproto.ClientToRelayMsg{
+	ctx, cancel := context.WithTimeout(context.Background(), pingInterval)
+	defer cancel()
+	return coalesceDatagrams(items, maxRelayBatch, &r.batchBuf,
+		func(m relayproto.ClientToRelayMsg) error { return client.Send(ctx, m) })
+}
+
+// coalesceDatagrams calls send once per wire frame. Batched Contents alias
+// *buf and are only valid during send.
+func coalesceDatagrams(items []RelaySendItem, maxSize int, buf *[]byte, send func(relayproto.ClientToRelayMsg) error) error {
+	var scratch []byte
+	if buf == nil {
+		buf = &scratch
+	}
+	for i := 0; i < len(items); {
+		head := items[i]
+		seg := len(head.Datagrams.Contents)
+		j := i + 1
+		total := seg
+		if head.Datagrams.SegmentSize == 0 && seg > 0 {
+			for j < len(items) {
+				it := items[j]
+				n := len(it.Datagrams.Contents)
+				if it.RemoteEndpoint != head.RemoteEndpoint || it.Datagrams.SegmentSize != 0 ||
+					it.Datagrams.Ecn != head.Datagrams.Ecn || n == 0 || n > seg || total+n > maxSize {
+					break
+				}
+				total += n
+				j++
+				if n < seg {
+					break
+				}
+			}
+		}
+		msg := relayproto.ClientToRelayMsg{
 			Type:          relayproto.FrameClientToRelayDatagram,
-			DstEndpointID: it.RemoteEndpoint,
-			Datagrams:     it.Datagrams,
-		})
-		if err != nil {
+			DstEndpointID: head.RemoteEndpoint,
+			Datagrams:     head.Datagrams,
+		}
+		if j-i > 1 {
+			b := (*buf)[:0]
+			for _, it := range items[i:j] {
+				b = append(b, it.Datagrams.Contents...)
+			}
+			*buf = b
+			msg.Datagrams.SegmentSize = uint16(seg)
+			msg.Datagrams.Contents = b
+		}
+		if err := send(msg); err != nil {
 			return err
 		}
+		i = j
 	}
 	return nil
 }
@@ -844,7 +899,15 @@ func (r *activeRelay) handleFrameAt(msg relayproto.RelayToClientMsg, st *connect
 			}
 		}
 		st.established = true
-	case relayproto.FrameStatus, relayproto.FrameHealth, relayproto.FrameRestarting:
+	case relayproto.FrameStatus:
+		// Rate limiting is worth surfacing — the relay is throttling our
+		// outbound traffic; other statuses are informational.
+		if msg.Status == relayproto.StatusRateLimited {
+			if mm := r.parent.metrics.Load(); mm != nil {
+				mm.relayRateLimited.Add(1)
+			}
+		}
+	case relayproto.FrameHealth, relayproto.FrameRestarting:
 		// Informational; ignored. Status/Health are version-gated by the parser.
 	}
 }

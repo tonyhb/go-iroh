@@ -9,11 +9,6 @@ import (
 	"github.com/tmc/go-iroh/netaddr"
 )
 
-// BlobAdder stores complete raw blobs.
-type BlobAdder interface {
-	Add([]byte) (Hash, error)
-}
-
 // BlobConnector opens blob protocol connections to providers.
 type BlobConnector interface {
 	Connect(ctx context.Context, addr netaddr.EndpointAddr, alpn string) (BlobConn, error)
@@ -78,7 +73,7 @@ type DownloaderOptions struct {
 
 // Downloader downloads blobs from multiple providers.
 type Downloader struct {
-	store BlobAdder
+	store Sink
 	conn  BlobConnector
 	opts  DownloaderOptions
 
@@ -92,7 +87,10 @@ type Downloader struct {
 }
 
 // NewDownloader returns a downloader using store and conn.
-func NewDownloader(store BlobAdder, conn BlobConnector, opts DownloaderOptions) *Downloader {
+//
+// store must implement [Sink]; downloaded content is streamed into a
+// [BlobWriter] rather than buffered.
+func NewDownloader(store Sink, conn BlobConnector, opts DownloaderOptions) *Downloader {
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = 1
 	}
@@ -118,28 +116,35 @@ func (d *Downloader) Close() error {
 }
 
 // Download downloads hash from one of providers and stores it locally.
-func (d *Downloader) Download(ctx context.Context, hash Hash, providers []netaddr.EndpointAddr) error {
+//
+// Download returns the [TempTag] protecting the stored blob. The blob is
+// collectible as soon as the tag is closed, so a caller that runs
+// [FSStore.GC] must hold it until it has established durable ownership,
+// usually by naming the blob with [FSStore.SetTag]. A caller that does not
+// collect garbage can close it immediately.
+func (d *Downloader) Download(ctx context.Context, hash Hash, providers []netaddr.EndpointAddr) (*TempTag, error) {
 	if d == nil {
-		return errors.New("blobs: nil downloader")
+		return nil, errors.New("blobs: nil downloader")
 	}
 	if d.store == nil {
-		return errors.New("blobs: nil downloader store")
+		return nil, errors.New("blobs: nil downloader store")
 	}
 	if d.conn == nil {
-		return errors.New("blobs: nil downloader connector")
+		return nil, errors.New("blobs: nil downloader connector")
 	}
 	if hash == EmptyHash {
-		got, err := d.store.Add(nil)
+		tag, err := d.commitEmpty(ctx)
 		if err != nil {
-			return fmt.Errorf("blobs: store empty blob: %w", err)
+			return nil, fmt.Errorf("blobs: store empty blob: %w", err)
 		}
-		if got != hash {
-			return fmt.Errorf("blobs: stored blob hash mismatch")
+		if tag.Hash() != hash {
+			tag.Close()
+			return nil, fmt.Errorf("blobs: stored blob hash mismatch")
 		}
-		return nil
+		return tag, nil
 	}
 	if len(providers) == 0 {
-		return errors.New("blobs: no providers")
+		return nil, errors.New("blobs: no providers")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -183,23 +188,27 @@ func (d *Downloader) Download(ctx context.Context, hash Hash, providers []netadd
 	}()
 
 	var err error
-	var ok bool
+	var won *TempTag
 	for res := range results {
 		if res.err == nil {
 			// First success wins. Cancel the remaining providers, but keep
 			// draining results so every worker (and its OnEvent delivery)
 			// finishes before Download returns — otherwise a late event races
-			// the caller's post-Download reads.
-			if !ok {
-				ok = true
+			// the caller's post-Download reads. Later winners are redundant
+			// copies of the same content, so release their tags.
+			if won == nil {
+				won = res.tag
 				cancel()
+			} else {
+				res.tag.Close()
 			}
 			continue
 		}
+		res.tag.Close()
 		err = errors.Join(err, res.err)
 	}
-	if ok {
-		return nil
+	if won != nil {
+		return won, nil
 	}
 	if err == nil {
 		err = ctx.Err()
@@ -207,11 +216,12 @@ func (d *Downloader) Download(ctx context.Context, hash Hash, providers []netadd
 	if err == nil {
 		err = errors.New("blobs: download failed")
 	}
-	return err
+	return nil, err
 }
 
 type downloadResult struct {
 	addr netaddr.EndpointAddr
+	tag  *TempTag
 	err  error
 }
 
@@ -230,25 +240,20 @@ func (d *Downloader) tryProvider(ctx context.Context, hash Hash, addr netaddr.En
 		d.event(DownloadEvent{Kind: DownloadProviderFailed, Hash: hash, Provider: addr, Err: err})
 		return downloadResult{addr: addr, err: err}
 	}
-	data, err := GetBlobBytes(ctx, stream, hash)
+	tag, err := d.streamBlob(ctx, stream, hash)
 	if err != nil {
 		err = fmt.Errorf("blobs: get blob from provider %s: %w", addr.ID, err)
 		d.event(DownloadEvent{Kind: DownloadProviderFailed, Hash: hash, Provider: addr, Err: err})
 		return downloadResult{addr: addr, err: err}
 	}
-	got, err := d.store.Add(data)
-	if err != nil {
-		err = fmt.Errorf("blobs: store blob: %w", err)
-		d.event(DownloadEvent{Kind: DownloadProviderFailed, Hash: hash, Provider: addr, Err: err})
-		return downloadResult{addr: addr, err: err}
-	}
-	if got != hash {
+	if tag.Hash() != hash {
+		tag.Close()
 		err = fmt.Errorf("blobs: stored blob hash mismatch")
 		d.event(DownloadEvent{Kind: DownloadProviderFailed, Hash: hash, Provider: addr, Err: err})
 		return downloadResult{addr: addr, err: err}
 	}
 	d.event(DownloadEvent{Kind: DownloadComplete, Hash: hash, Provider: addr})
-	return downloadResult{addr: addr}
+	return downloadResult{addr: addr, tag: tag}
 }
 
 func (d *Downloader) connection(ctx context.Context, addr netaddr.EndpointAddr) (BlobConn, error) {
@@ -292,4 +297,28 @@ func (d *Downloader) event(ev DownloadEvent) {
 	d.eventMu.Lock()
 	defer d.eventMu.Unlock()
 	d.opts.OnEvent(ev)
+}
+
+// streamBlob downloads hash from stream straight into a [BlobWriter], so the
+// blob is never held in memory, and returns the tag protecting it.
+func (d *Downloader) streamBlob(ctx context.Context, stream BidiStream, hash Hash) (*TempTag, error) {
+	w, err := d.store.NewBlob(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+	if err := DownloadBlob(ctx, stream, hash, w); err != nil {
+		return nil, err
+	}
+	return w.Commit()
+}
+
+// commitEmpty stores the zero-length blob.
+func (d *Downloader) commitEmpty(ctx context.Context) (*TempTag, error) {
+	w, err := d.store.NewBlob(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+	return w.Commit()
 }

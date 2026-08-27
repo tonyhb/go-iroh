@@ -98,10 +98,13 @@ func NewPathWatcher() *PathWatcher {
 // before Subscribe are not replayed. The channel is closed when the subscriber
 // is cancelled or the watcher is closed.
 //
-// The cancel function must be called when the subscriber is done, like
-// [time.Ticker.Stop]: each subscription runs a delivery goroutine, and
-// [PathWatcher.Close] drains to subscribers that may still be reading, so a
-// subscription that is abandoned unread without cancelling leaks its goroutine.
+// The cancel function should be called when the subscriber is done, like
+// [time.Ticker.Stop]: each subscription runs a delivery goroutine, which
+// cancel stops without waiting for the subscriber to drain. [PathWatcher.Close]
+// stops the goroutine of every remaining subscriber, so an abandoned
+// subscription outlives at most the watcher itself. Events already buffered on
+// the channel stay readable after it is closed; events still pending delivery
+// when a subscriber stops reading are dropped.
 func (w *PathWatcher) Subscribe() (<-chan PathEvent, func()) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -128,7 +131,7 @@ func (w *PathWatcher) unsubscribe(s *pathSub) {
 	}
 	delete(w.subs, s)
 	w.mu.Unlock()
-	s.close(false)
+	s.close()
 }
 
 // Send broadcasts ev to every subscriber. A subscriber whose ring buffer is full
@@ -168,7 +171,7 @@ func (w *PathWatcher) Close() {
 	w.subs = make(map[*pathSub]struct{})
 	w.mu.Unlock()
 	for _, s := range subs {
-		s.close(true)
+		s.close()
 	}
 }
 
@@ -191,9 +194,10 @@ func (s *pathSub) enqueue(ev PathEvent) {
 	s.mu.Unlock()
 }
 
-// close marks the subscriber closed, wakes its delivery goroutine, and lets it
-// close the channel. Idempotent.
-func (s *pathSub) close(drain bool) {
+// close marks the subscriber closed, wakes its delivery goroutine, and
+// interrupts an in-flight send so the goroutine cannot outlive the
+// subscription. Idempotent.
+func (s *pathSub) close() {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -202,9 +206,7 @@ func (s *pathSub) close(drain bool) {
 	s.closed = true
 	s.cond.Signal()
 	s.mu.Unlock()
-	if !drain {
-		s.once.Do(func() { close(s.done) })
-	}
+	s.once.Do(func() { close(s.done) })
 }
 
 // deliver is the per-subscriber delivery goroutine. It pops events from the ring

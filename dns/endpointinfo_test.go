@@ -71,13 +71,13 @@ func TestSignedPacketRoundTrip(t *testing.T) {
 	)
 	data.SetUserData(&ud)
 	want := EndpointInfo{ID: sk.Public().EndpointID(), Data: data}
-	packet, err := want.ToPkarrSignedPacket(sk, 30)
+	packet, err := want.ToSignedPacket(sk, 30)
 	if err != nil {
-		t.Fatalf("ToPkarrSignedPacket: %v", err)
+		t.Fatalf("ToSignedPacket: %v", err)
 	}
-	got, err := EndpointInfoFromPkarrSignedPacket(packet)
+	got, err := EndpointInfoFromSignedPacket(packet)
 	if err != nil {
-		t.Fatalf("EndpointInfoFromPkarrSignedPacket: %v", err)
+		t.Fatalf("EndpointInfoFromSignedPacket: %v", err)
 	}
 	assertEndpointInfoEqual(t, got, want)
 }
@@ -98,11 +98,11 @@ func TestSignedPacketRoundTripCustomAddr(t *testing.T) {
 	)
 	data.SetUserData(&ud)
 	want := EndpointInfo{ID: sk.Public().EndpointID(), Data: data}
-	packet, err := want.ToPkarrSignedPacket(sk, 30)
+	packet, err := want.ToSignedPacket(sk, 30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := EndpointInfoFromPkarrSignedPacket(packet)
+	got, err := EndpointInfoFromSignedPacket(packet)
 	if err != nil {
 		t.Fatal(err)
 	}

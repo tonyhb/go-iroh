@@ -1,9 +1,11 @@
 package socket
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/tmc/go-iroh/internal/relayproto"
+	"github.com/tmc/go-iroh/key"
 	"github.com/tmc/go-iroh/netaddr"
 	"github.com/tmc/go-iroh/relay"
 	"github.com/tmc/go-iroh/watch"
@@ -59,38 +61,31 @@ func (t *RelayTransport) forwardRecv(ctx context.Context) {
 }
 
 // deliver splits dm into single datagrams (by its segment size) and forwards
-// each to the recv channel.
+// each to the recv channel. dm.Datagrams.Contents is owned by dm (the relay
+// client copies on receive) and ReadFrom copies out, so segments alias it.
 func (t *RelayTransport) deliver(ctx context.Context, dm RelayRecvDatagram) {
 	remote := RelayAddr(dm.URL, dm.Src)
-	for _, seg := range splitSegments(dm.Datagrams) {
-		data := make([]byte, len(seg))
-		copy(data, seg)
+	b := dm.Datagrams.Contents
+	stride := max(len(b), 1)
+	if dm.Datagrams.SegmentSize != 0 {
+		stride = int(dm.Datagrams.SegmentSize)
+	}
+	for {
+		n := min(len(b), stride)
+		rb := recvBatch{data: b[:n], info: RecvInfo{Remote: remote}}
+		if n == len(b) {
+			rb.releaseFn = dm.Datagrams.Release
+		}
 		select {
-		case t.recvCh <- recvBatch{data: data, info: RecvInfo{Remote: remote}}:
+		case t.recvCh <- rb:
 		case <-ctx.Done():
 			return
 		}
-	}
-}
-
-// splitSegments returns the individual datagrams in d. A zero segment size means
-// a single datagram; otherwise the contents are sliced into segment-size strides
-// (the final segment may be shorter), matching the relay GRO stride
-// (iroh/src/socket/transports/relay.rs:154).
-func splitSegments(d relayproto.Datagrams) [][]byte {
-	if d.SegmentSize == 0 || len(d.Contents) == 0 {
-		return [][]byte{d.Contents}
-	}
-	stride := int(d.SegmentSize)
-	var out [][]byte
-	for off := 0; off < len(d.Contents); off += stride {
-		end := off + stride
-		if end > len(d.Contents) {
-			end = len(d.Contents)
+		b = b[n:]
+		if len(b) == 0 {
+			return
 		}
-		out = append(out, d.Contents[off:end])
 	}
-	return out
 }
 
 // Send routes p to the relay addressed by the relay mapped address m. It looks
@@ -100,15 +95,39 @@ func splitSegments(d relayproto.Datagrams) [][]byte {
 // is treated as lost (QUIC's loss recovery retransmits), matching the Rust
 // blackhole-on-failure invariant (iroh/src/socket/transports.rs:1176).
 func (t *RelayTransport) Send(m RelayMappedAddr, p []byte) bool {
+	return t.SendBatch(m, p, 0)
+}
+
+// maxRelayBatch is the largest Datagrams.Contents that fits a relay frame.
+const maxRelayBatch = relayproto.MaxPacketSize - key.PublicKeySize - 3
+
+// SendBatch is Send for a GSO-style buffer of segSize-sized datagrams (the
+// last may be shorter). segSize 0 means a single datagram.
+func (t *RelayTransport) SendBatch(m RelayMappedAddr, p []byte, segSize int) bool {
 	rk, ok := t.sock.LookupRelay(m)
 	if !ok {
 		return false
 	}
-	return t.actor.Send(RelaySendItem{
-		RemoteEndpoint: rk.EID,
-		URL:            rk.URL,
-		Datagrams:      relayproto.DatagramsFromBytes(p),
-	})
+	if segSize <= 0 || segSize >= len(p) {
+		return t.actor.Send(RelaySendItem{
+			RemoteEndpoint: rk.EID,
+			URL:            rk.URL,
+			Datagrams:      relayproto.DatagramsFromBytes(p),
+		})
+	}
+	per := max(1, maxRelayBatch/segSize) * segSize
+	for len(p) > 0 {
+		n := min(len(p), per)
+		d := relayproto.Datagrams{Contents: bytes.Clone(p[:n])}
+		if n > segSize {
+			d.SegmentSize = uint16(segSize)
+		}
+		if !t.actor.Send(RelaySendItem{RemoteEndpoint: rk.EID, URL: rk.URL, Datagrams: d}) {
+			return false
+		}
+		p = p[n:]
+	}
+	return true
 }
 
 // SetHomeRelay designates url as the endpoint's home relay. See

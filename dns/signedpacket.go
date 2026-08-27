@@ -7,6 +7,10 @@ import (
 	"github.com/tmc/go-iroh/key"
 )
 
+// MaxSignedPacketSize is the maximum wire size of a signed packet, including
+// its public key.
+const MaxSignedPacketSize = pkarr.MaxBytes
+
 // SignedPacket is a signed DNS packet in the pkarr format used for iroh
 // endpoint discovery.
 //
@@ -71,6 +75,18 @@ func (p *SignedPacket) TimestampMicros() uint64 {
 		return 0
 	}
 	return uint64(p.packet.Timestamp())
+}
+
+// MoreRecentThan reports whether p should replace other. Equal timestamps are
+// ordered by their encoded DNS packets, matching pkarr's conflict rule.
+func (p *SignedPacket) MoreRecentThan(other *SignedPacket) bool {
+	if p == nil || p.packet == nil {
+		return false
+	}
+	if other == nil || other.packet == nil {
+		return true
+	}
+	return p.packet.MoreRecentThan(other.packet)
 }
 
 // TXTRecords returns the TXT string values under name, normalized relative to

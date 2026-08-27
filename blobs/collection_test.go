@@ -72,10 +72,7 @@ func TestGetCollectionBytes(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(hash Hash) ([]byte, bool) {
-			b, ok := blobs[hash]
-			return append([]byte(nil), b...), ok
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, blobValues(blobs)...))
 	}()
 	gotCollection, got, err := GetCollectionBytes(context.Background(), client, collection.Root())
 	if err != nil {

@@ -10,4 +10,6 @@
 // records of the form "key=value" (RFC 1464), with keys "relay", "addr", and
 // "user-data". [EndpointInfo] converts to and from both TXT record sets and
 // pkarr signed packets.
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package dns

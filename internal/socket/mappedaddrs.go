@@ -203,3 +203,23 @@ func (m *AddrMap[K, V]) Lookup(addr netip.Addr) (K, bool) {
 	k, ok := m.rev[addr]
 	return k, ok
 }
+
+// Remove deletes the mapping for key, if any. The next Get of the same key
+// generates a fresh mapped address.
+func (m *AddrMap[K, V]) Remove(key K) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.fwd[key]
+	if !ok {
+		return
+	}
+	delete(m.fwd, key)
+	delete(m.rev, m.addrOf(v))
+}
+
+// Len returns the number of mappings. Intended for tests and metrics.
+func (m *AddrMap[K, V]) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.fwd)
+}

@@ -23,25 +23,43 @@ func TestFSStoreConcurrentStress(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < rounds; i++ {
 				data := []byte(fmt.Sprintf("worker=%02d round=%02d", worker, i))
-				hash, err := store.Add(data)
+				// Write through the protected path: Commit installs the blob
+				// and its temp tag under one lock, so no concurrent GC can
+				// collect it before this worker holds a claim on it.
+				w, err := store.NewBlob(context.Background())
 				if err != nil {
-					t.Errorf("Add: %v", err)
+					t.Errorf("NewBlob: %v", err)
 					return
 				}
+				if _, err := w.Write(data); err != nil {
+					_ = w.Close()
+					t.Errorf("Write: %v", err)
+					return
+				}
+				temp, err := w.Commit()
+				if err != nil {
+					_ = w.Close()
+					t.Errorf("Commit: %v", err)
+					return
+				}
+				hash := temp.Hash()
 				value := RawHash(hash)
 				tag := fmt.Sprintf("worker-%02d", worker)
 				if err := store.SetTag(tag, value); err != nil {
 					t.Errorf("SetTag: %v", err)
+					_ = temp.Close()
 					return
 				}
-				temp, err := store.NewTempTag(value)
-				if err != nil {
-					t.Errorf("NewTempTag: %v", err)
+				if _, err := store.BlobStatus(context.Background(), hash); err != nil {
+					t.Errorf("BlobStatus: %v", err)
+					_ = temp.Close()
 					return
 				}
-				store.BlobStatus(hash)
-				if _, _, err := store.Get(context.Background(), hash); err != nil {
-					t.Errorf("Get: %v", err)
+				// The worker holds a temp tag on hash for this whole round, so
+				// a concurrent GC must not be able to collect it. Any error
+				// here, absence included, is a failure.
+				if _, err := store.Open(context.Background(), hash); err != nil {
+					t.Errorf("Open: %v", err)
 					_ = temp.Close()
 					return
 				}

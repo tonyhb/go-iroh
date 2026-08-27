@@ -1,4 +1,6 @@
 // Package irpc provides small postcard-framed RPC helpers for iroh streams.
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package irpc
 
 import (

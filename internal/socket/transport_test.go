@@ -493,15 +493,14 @@ func TestMagicConnReadDeadline(t *testing.T) {
 }
 
 // TestMagicConnNotOOBCapable pins that MagicConn deliberately does not satisfy
-// quic-go's OOBCapablePacketConn, so quic-go uses its single-packet recv/send
-// path. It does expose SyscallConn for buffer sizing and the DF bit, which
-// alone does not make it OOB-capable.
+// quic-go's OOBCapablePacketConn. It does expose SyscallConn for buffer sizing
+// and the DF bit, which alone does not make it OOB-capable.
 func TestMagicConnNotOOBCapable(t *testing.T) {
 	m, _, stop := newLoopbackMagic(t)
 	defer stop()
 
 	if _, ok := any(m).(quic.OOBCapablePacketConn); ok {
-		t.Error("MagicConn satisfies OOBCapablePacketConn; it must not (would enable GSO/GRO that do not generalize across transports)")
+		t.Error("MagicConn satisfies OOBCapablePacketConn; receive-side OOB metadata does not generalize across transports")
 	}
 	if _, ok := any(m).(net.PacketConn); !ok {
 		t.Error("MagicConn must satisfy net.PacketConn")

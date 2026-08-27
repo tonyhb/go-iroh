@@ -107,27 +107,63 @@ func (s *FSStore) Tags() ([]TagInfo, error) {
 	return out, nil
 }
 
-// TempTag is a process-local tag removed when closed.
+// TempTag is a process-local tag that protects a blob from collection until it
+// is closed.
+//
+// A TempTag whose store never collects blobs, such as [MemStore], protects
+// nothing and Close is a no-op. Value reports what the tag protects.
 type TempTag struct {
 	once  sync.Once
-	store *FSStore
+	store tempTagStore
 	id    uint64
+	value HashAndFormat
 }
 
+// tempTagStore is the part of a store a TempTag needs to release itself.
+type tempTagStore interface {
+	releaseTempTag(id uint64)
+}
+
+// Value returns the hash and format t protects.
+func (t *TempTag) Value() HashAndFormat {
+	if t == nil {
+		return HashAndFormat{}
+	}
+	return t.value
+}
+
+// Hash returns the hash t protects.
+func (t *TempTag) Hash() Hash { return t.Value().Hash }
+
 // NewTempTag creates a process-local tag for value.
+//
+// A blob is collectible between the moment it is stored and the moment a tag
+// names it, so NewTempTag cannot protect a blob a caller has only just added.
+// Use [BlobWriter.Commit], which installs the blob and its tag together.
 func (s *FSStore) NewTempTag(value HashAndFormat) (*TempTag, error) {
 	if s == nil {
 		return nil, errors.New("blobs: nil fs store")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.newTempTagLocked(value), nil
+}
+
+// newTempTagLocked creates a temp tag for value. s.mu must be held for writing.
+func (s *FSStore) newTempTagLocked(value HashAndFormat) *TempTag {
 	if s.temp == nil {
 		s.temp = make(map[uint64]HashAndFormat)
 	}
 	s.nextTag++
 	id := s.nextTag
 	s.temp[id] = value
-	return &TempTag{store: s, id: id}, nil
+	return &TempTag{store: s, id: id, value: value}
+}
+
+func (s *FSStore) releaseTempTag(id uint64) {
+	s.mu.Lock()
+	delete(s.temp, id)
+	s.mu.Unlock()
 }
 
 // Close removes t from its store.
@@ -135,11 +171,7 @@ func (t *TempTag) Close() error {
 	if t == nil || t.store == nil {
 		return nil
 	}
-	t.once.Do(func() {
-		t.store.mu.Lock()
-		delete(t.store.temp, t.id)
-		t.store.mu.Unlock()
-	})
+	t.once.Do(func() { t.store.releaseTempTag(t.id) })
 	return nil
 }
 

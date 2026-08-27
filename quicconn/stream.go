@@ -1,4 +1,4 @@
-package http3
+package quicconn
 
 import (
 	"context"

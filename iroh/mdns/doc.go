@@ -6,4 +6,6 @@
 // link and resolves peers advertised by other Discovery values. It implements
 // iroh.AddressPublisher and iroh.AddressResolver, so it can be registered with
 // iroh.AddressLookupServices.
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package mdns

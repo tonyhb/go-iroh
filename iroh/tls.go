@@ -28,6 +28,36 @@ var base32DNSSEC = base32.NewEncoding("0123456789abcdefghijklmnopqrstuv").WithPa
 // protocol marker.
 const tlsNameSuffix = ".iroh.invalid"
 
+// KeyExchangePolicy selects the TLS key-exchange groups offered by an
+// endpoint. The zero value uses the package default.
+type KeyExchangePolicy uint8
+
+const (
+	// KeyExchangeDefault uses the package default key-exchange groups.
+	KeyExchangeDefault KeyExchangePolicy = iota
+	// KeyExchangeClassical disables post-quantum key exchange.
+	KeyExchangeClassical
+	// KeyExchangePreferPQ prefers X25519MLKEM768 and retains classical fallback.
+	KeyExchangePreferPQ
+	// KeyExchangePQOnly requires X25519MLKEM768.
+	KeyExchangePQOnly
+)
+
+func (p KeyExchangePolicy) valid() bool { return p <= KeyExchangePQOnly }
+
+func (p KeyExchangePolicy) curves() []tls.CurveID {
+	switch p {
+	case KeyExchangeClassical:
+		return []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}
+	case KeyExchangePreferPQ:
+		return []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384}
+	case KeyExchangePQOnly:
+		return []tls.CurveID{tls.X25519MLKEM768}
+	default:
+		return nil
+	}
+}
+
 // ServerName returns the TLS server name (SNI) iroh uses to address id:
 // BASE32_DNSSEC(id) + ".iroh.invalid". A dialing endpoint puts this in its
 // ClientHello; the accepting endpoint proves it holds id by presenting id as
@@ -94,6 +124,10 @@ func peerEndpointID(cs tls.ConnectionState) (key.EndpointID, error) {
 // mirrors the Rust client config, which enables early data and stores tickets
 // in a ClientSessionMemoryCache (iroh/src/tls.rs:86-87).
 func clientTLSConfig(sk key.SecretKey, want key.EndpointID, alpns []string, cache tls.ClientSessionCache) (*tls.Config, error) {
+	return clientTLSConfigWithCurves(sk, want, alpns, cache, nil)
+}
+
+func clientTLSConfigWithCurves(sk key.SecretKey, want key.EndpointID, alpns []string, cache tls.ClientSessionCache, curves []tls.CurveID) (*tls.Config, error) {
 	cert, err := rawKeyCertificate(sk)
 	if err != nil {
 		return nil, err
@@ -105,6 +139,7 @@ func clientTLSConfig(sk key.SecretKey, want key.EndpointID, alpns []string, cach
 		MaxVersion:             tls.VersionTLS13,
 		SessionTicketsDisabled: cache == nil,
 		ClientSessionCache:     cache,
+		CurvePreferences:       curves,
 		NextProtos:             alpns,
 		ServerName:             ServerName(want),
 		InsecureSkipVerify:     true, // chain verification is replaced by VerifyConnection
@@ -132,6 +167,10 @@ func clientTLSConfig(sk key.SecretKey, want key.EndpointID, alpns []string, cach
 // = u32::MAX on those tickets when 0-RTT acceptance is enabled (RFC 9001 §4.6.1,
 // iroh/src/tls.rs:118); the iroh server opts in via [quic.Config.Allow0RTT].
 func serverTLSConfig(sk key.SecretKey, alpns []string) (*tls.Config, error) {
+	return serverTLSConfigWithCurves(sk, alpns, nil)
+}
+
+func serverTLSConfigWithCurves(sk key.SecretKey, alpns []string, curves []tls.CurveID) (*tls.Config, error) {
 	cert, err := rawKeyCertificate(sk)
 	if err != nil {
 		return nil, err
@@ -142,6 +181,7 @@ func serverTLSConfig(sk key.SecretKey, alpns []string) (*tls.Config, error) {
 		MinVersion:             tls.VersionTLS13,
 		MaxVersion:             tls.VersionTLS13,
 		SessionTicketsDisabled: false,
+		CurvePreferences:       curves,
 		NextProtos:             alpns,
 		ClientAuth:             tls.RequireAnyClientCert,
 		InsecureSkipVerify:     true,

@@ -117,7 +117,6 @@ func TestBrowserBlobRelayOnlyFetch(t *testing.T) {
 	mode := relay.ModeCustom(relay.MapFromURLs(relayURL))
 	const size = 70 * 1024
 	data := blobPayloadNative(size)
-	hash := blobs.NewHash(data)
 
 	server, err := iroh.Bind(ctx,
 		iroh.WithRelayMode(mode),
@@ -133,12 +132,7 @@ func TestBrowserBlobRelayOnlyFetch(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return blobs.ServeBlob(ctx, stream, blobs.StoreFunc(func(got blobs.Hash) ([]byte, bool) {
-				if got != hash {
-					return nil, false
-				}
-				return append([]byte(nil), data...), true
-			}))
+			return blobs.ServeBlob(ctx, stream, mustBlobStore(t, data))
 		}),
 	}, nil)
 	if err != nil {
@@ -606,4 +600,14 @@ detail: document.body && document.body.getAttribute("data-detail")
 		}
 		return status.Status, status.Detail, nil
 	}
+}
+
+// mustBlobStore returns an in-memory blob store holding data.
+func mustBlobStore(t *testing.T, data ...[]byte) *blobs.MemStore {
+	t.Helper()
+	m, err := blobs.NewMemStore(data...)
+	if err != nil {
+		t.Fatalf("NewMemStore: %v", err)
+	}
+	return m
 }

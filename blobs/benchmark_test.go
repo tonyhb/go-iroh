@@ -83,12 +83,9 @@ func BenchmarkFSStorePutGet(b *testing.B) {
 		b.SetBytes(int64(len(data)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			entry, ok, err := store.Get(ctx, hash)
+			entry, err := store.Open(ctx, hash)
 			if err != nil {
 				b.Fatal(err)
-			}
-			if !ok {
-				b.Fatal("stored blob missing")
 			}
 			r, err := entry.DataReader(ctx)
 			if err != nil {

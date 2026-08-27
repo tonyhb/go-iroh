@@ -1,16 +1,14 @@
 package blobs
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestStatus(t *testing.T) {
 	data := []byte("stored blob")
 	hash := NewHash(data)
-	store := StoreFunc(func(got Hash) ([]byte, bool) {
-		if got != hash {
-			return nil, false
-		}
-		return append([]byte(nil), data...), true
-	})
+	store := mustStore(t, data)
 
 	tests := []struct {
 		name string
@@ -23,18 +21,26 @@ func TestStatus(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := Status(store, tt.hash); got != tt.want {
+			got, err := Status(context.Background(), store, tt.hash)
+			if err != nil {
+				t.Fatalf("Status: %v", err)
+			}
+			if got != tt.want {
 				t.Fatalf("Status = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestStatusUsesBlobStater(t *testing.T) {
+func TestStatusUsesStater(t *testing.T) {
 	hash := NewHash([]byte("partial"))
 	store := statusStore{hash: hash, status: PartialBlobStatus(123)}
 
-	if got := Status(store, hash); got != store.status {
+	got, err := Status(context.Background(), store, hash)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if got != store.status {
 		t.Fatalf("Status = %+v, want %+v", got, store.status)
 	}
 }
@@ -44,11 +50,11 @@ type statusStore struct {
 	status BlobStatus
 }
 
-func (s statusStore) GetBlob(Hash) ([]byte, bool) { return nil, false }
+func (s statusStore) Open(context.Context, Hash) (Blob, error) { return nil, ErrBlobNotFound }
 
-func (s statusStore) BlobStatus(hash Hash) BlobStatus {
+func (s statusStore) BlobStatus(_ context.Context, hash Hash) (BlobStatus, error) {
 	if hash != s.hash {
-		return NotFoundBlobStatus()
+		return NotFoundBlobStatus(), nil
 	}
-	return s.status
+	return s.status, nil
 }

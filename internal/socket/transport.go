@@ -33,10 +33,10 @@ type Transports struct {
 // (iroh/src/socket/transports.rs:1067).
 //
 // MagicConn satisfies net.PacketConn. It deliberately does not satisfy
-// quic-go's OOBCapablePacketConn: GSO/GRO/ECN are per-platform UDP-socket
-// optimizations that do not generalize across relay and custom transports, so
-// quic-go falls back to its single-packet basicConn path. Correctness does not
-// depend on them.
+// quic-go's OOBCapablePacketConn: GRO and ECN receive metadata do not
+// generalize across relay and custom transports. On Linux it exposes a narrower
+// send-message method so qng can use GSO for direct IP destinations and split
+// the same write for other transports. Correctness does not depend on it.
 //
 // Create one with [NewMagicConn] and start it with [MagicConn.Serve]. The zero
 // value is not usable.
@@ -51,8 +51,10 @@ type MagicConn struct {
 	readDeadline  deadline
 	writeDeadline deadline
 
-	recvAddrs map[netip.AddrPort]*net.UDPAddr
-	metrics   Metrics
+	recvAddrsMu sync.RWMutex
+	recvAddrs   map[netip.AddrPort]*net.UDPAddr
+
+	metrics Metrics
 
 	endpointMu     sync.RWMutex
 	endpointSender func(key.EndpointID, []byte) bool
@@ -116,6 +118,9 @@ func newMagicConn(sock *Socket, udp *net.UDPConn, actor *RelayActor, custom ...C
 	}
 	m.readDeadline.init()
 	m.writeDeadline.init()
+	if actor != nil {
+		actor.setMetrics(&m.metrics)
+	}
 	return m
 }
 
@@ -169,7 +174,7 @@ func (m *MagicConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				// quic-go. Drop and keep reading.
 				continue
 			}
-			m.recordRecv(b.info.Remote)
+			m.recordRecv(b.recvAddr())
 			n := copy(p, b.data)
 			b.release()
 			return n, addr, nil
@@ -236,12 +241,26 @@ func (m *MagicConn) recvAddr(info RecvInfo) (net.Addr, bool) {
 	}
 }
 
+// udpAddr returns the *net.UDPAddr for ap, caching it so that repeated
+// receives from one peer return the same value. ReadFrom may run from several
+// goroutines, so the cache is locked; the read path takes the shared lock and
+// only a first sighting takes the exclusive one.
 func (m *MagicConn) udpAddr(ap netip.AddrPort) *net.UDPAddr {
 	ap = canonicalAddrPort(ap)
+	m.recvAddrsMu.RLock()
+	addr, ok := m.recvAddrs[ap]
+	m.recvAddrsMu.RUnlock()
+	if ok {
+		return addr
+	}
+	m.recvAddrsMu.Lock()
+	defer m.recvAddrsMu.Unlock()
+	// Another goroutine may have added ap since the shared lock was dropped.
+	// Reuse its value so that one peer keeps one address.
 	if addr, ok := m.recvAddrs[ap]; ok {
 		return addr
 	}
-	addr := udpAddrFromAddrPort(ap)
+	addr = udpAddrFromAddrPort(ap)
 	m.recvAddrs[ap] = addr
 	return addr
 }
@@ -331,6 +350,32 @@ func isDefinitelyIP(addr netip.Addr) bool {
 		return true
 	}
 	return addr.As16()[0] != 0xfd
+}
+
+func segmentCount(n, segmentSize int) int {
+	if segmentSize <= 0 {
+		return 1
+	}
+	return (n + segmentSize - 1) / segmentSize
+}
+
+// sendRelayBatch forwards a segmented buffer to a relay mapped destination as
+// relay batch frames. It reports false if dst is not a known relay address.
+func (m *MagicConn) sendRelayBatch(dst netip.Addr, p []byte, segSize int) bool {
+	if m.transports.relay == nil || Classify(dst) != KindRelay {
+		return false
+	}
+	mapped := RelayMappedAddrFromAddr(dst)
+	if _, ok := m.sock.LookupRelay(mapped); !ok {
+		return false
+	}
+	segs := uint64(segmentCount(len(p), segSize))
+	if m.transports.relay.SendBatch(mapped, p, segSize) {
+		m.metrics.relaySent.Add(segs)
+	} else {
+		m.metrics.blackholed.Add(segs)
+	}
+	return true
 }
 
 // relayAddrForMapped returns the relay Addr for mapped.
@@ -471,9 +516,9 @@ func (m *MagicConn) SetWriteDeadline(t time.Time) error {
 
 // SyscallConn returns the underlying UDP socket's raw connection. quic-go uses
 // it to size the kernel receive buffer and to set the Don't Fragment bit on the
-// direct-IP path. Exposing it does not make MagicConn an OOBCapablePacketConn —
-// that interface also needs ReadMsgUDP/WriteMsgUDP, which MagicConn does not
-// provide, so quic-go still uses its single-packet path.
+// direct-IP path. Exposing it does not make MagicConn an OOBCapablePacketConn.
+// On Linux qng combines it with MagicConn's send-message method for send-side
+// GSO only.
 func (m *MagicConn) SyscallConn() (syscall.RawConn, error) {
 	if m.udp == nil {
 		return nil, errors.ErrUnsupported

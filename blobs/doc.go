@@ -6,4 +6,7 @@
 // RFC 4648 base32 without padding, matching Rust's iroh-blobs ticket format.
 // The transfer helpers implement the raw full-blob subset of the iroh-blobs
 // provider protocol.
+//
+// The Go API is not stable before v1 and may change in any v0 release; the
+// wire format tracks pinned upstream iroh-blobs releases and does not.
 package blobs

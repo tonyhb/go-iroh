@@ -4,6 +4,8 @@
 //
 // It is the public surface of the Rust crate iroh-relay (the client connection
 // and wire protocol live in internal packages).
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package relay
 
 import (
@@ -80,11 +82,15 @@ func NewMap(configs ...Config) *Map {
 	return m
 }
 
-// MapFromURLs builds a Map from relay URLs, each with a default config.
+// MapFromURLs builds a Map from relay URLs, each with a default config that
+// enables QUIC address discovery on [DefaultQUICPort]. net_report only probes
+// relays whose config has a QUIC section, so a nil default would disable
+// address discovery for every URL-built map, including [DefaultMap]. A relay
+// without QAD just fails the probe, which stays latency-only.
 func MapFromURLs(urls ...netaddr.RelayURL) *Map {
 	configs := make([]Config, len(urls))
 	for i, u := range urls {
-		configs[i] = Config{URL: u}
+		configs[i] = Config{URL: u, QUIC: &QUICConfig{Port: DefaultQUICPort}}
 	}
 	return NewMap(configs...)
 }

@@ -62,22 +62,15 @@ func (s *frameSorter) push(data []byte, offset protocol.ByteCount, frame *wire.S
 	start := offset
 	end := offset + protocol.ByteCount(len(data))
 
+	// In-order fast path: the frame starts at the read position and lies
+	// entirely within the first gap. Data extending past the first gap's end
+	// overlaps queued entries and may reach into later gaps, so it must go
+	// through the general overlap handling below — truncating it here would
+	// silently discard bytes the sender will never retransmit, permanently
+	// stalling the stream.
 	if start == s.readPos {
 		if _, ok := s.queue[start]; !ok {
-			if gap := s.gaps.Front(); gap != nil && gap.Value.Start == start {
-				if end > gap.Value.End {
-					data = data[:gap.Value.End-start]
-					end = gap.Value.End
-					if len(data) < protocol.MinStreamFrameBufferSize {
-						newData := make([]byte, len(data))
-						copy(newData, data)
-						data = newData
-						if frame != nil {
-							frame.PutBack()
-							frame = nil
-						}
-					}
-				}
+			if gap := s.gaps.Front(); gap != nil && gap.Value.Start == start && end <= gap.Value.End {
 				if end == gap.Value.End {
 					s.gaps.Remove(gap)
 				} else {

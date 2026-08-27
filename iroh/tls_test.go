@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/x509"
+	"slices"
 	"testing"
 
 	tls "github.com/tmc/go-iroh/internal/itls/tls"
@@ -114,6 +115,57 @@ func TestTLSConfigsMatchIrohRawKeyContract(t *testing.T) {
 	}
 	if noCache.ClientSessionCache != nil {
 		t.Error("client set a session cache when nil was passed")
+	}
+}
+
+func TestTLSConfigCurvePreferences(t *testing.T) {
+	serverKey := key.NewSecretKey([key.SeedSize]byte{1})
+	clientKey := key.NewSecretKey([key.SeedSize]byte{2})
+	tests := []struct {
+		name   string
+		curves []tls.CurveID
+	}{
+		{name: "default"},
+		{name: "prefer pq", curves: []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384}},
+		{name: "pq only", curves: []tls.CurveID{tls.X25519MLKEM768}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := clientTLSConfigWithCurves(clientKey, serverKey.Public().EndpointID(), []string{"iroh-test/0"}, nil, tt.curves)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := serverTLSConfigWithCurves(serverKey, []string{"iroh-test/0"}, tt.curves)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(client.CurvePreferences, tt.curves) {
+				t.Errorf("client CurvePreferences = %v, want %v", client.CurvePreferences, tt.curves)
+			}
+			if !slices.Equal(server.CurvePreferences, tt.curves) {
+				t.Errorf("server CurvePreferences = %v, want %v", server.CurvePreferences, tt.curves)
+			}
+		})
+	}
+}
+
+func TestKeyExchangePolicyCurves(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy KeyExchangePolicy
+		want   []tls.CurveID
+	}{
+		{name: "default", policy: KeyExchangeDefault},
+		{name: "classical", policy: KeyExchangeClassical, want: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}},
+		{name: "prefer pq", policy: KeyExchangePreferPQ, want: []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384}},
+		{name: "pq only", policy: KeyExchangePQOnly, want: []tls.CurveID{tls.X25519MLKEM768}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.policy.curves(); !slices.Equal(got, tt.want) {
+				t.Fatalf("curves = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

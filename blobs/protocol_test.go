@@ -174,6 +174,13 @@ func TestObserveItemWireFormat(t *testing.T) {
 	}
 }
 
+func TestObserveItemRejectsImpossibleBoundaryCount(t *testing.T) {
+	_, err := readObserveItem(newByteReader(impossibleObserveItem()))
+	if !errors.Is(err, endpointticket.ErrTruncated) {
+		t.Fatalf("readObserveItem error = %v, want %v", err, endpointticket.ErrTruncated)
+	}
+}
+
 func TestRequestDecodeErrors(t *testing.T) {
 	if _, err := DecodeRequestBytes([]byte{byte(RequestPush)}); !errors.Is(err, endpointticket.ErrVerify) {
 		t.Fatalf("DecodeRequestBytes unsupported error = %v", err)
@@ -212,4 +219,31 @@ func (w bytesBuffer) Write(p []byte) (int, error) {
 
 func newByteReader(b []byte) *bufio.Reader {
 	return bufio.NewReader(bytes.NewReader(b))
+}
+
+func impossibleObserveItem() []byte {
+	item := appendVarint(nil, 0)
+	item = appendVarint(item, 1<<60)
+	frame := appendVarint(nil, uint64(len(item)))
+	return append(frame, item...)
+}
+
+// TestRequestTypeWireValues pins the Rust iroh-blobs wire discriminants. The
+// gap at 2-7 is reserved by that numbering; these values are protocol, not
+// implementation detail, and may not be renumbered.
+func TestRequestTypeWireValues(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		got  RequestType
+		want uint64
+	}{
+		{"RequestGet", RequestGet, 0},
+		{"RequestObserve", RequestObserve, 1},
+		{"RequestPush", RequestPush, 8},
+		{"RequestGetMany", RequestGetMany, 9},
+	} {
+		if uint64(tt.got) != tt.want {
+			t.Errorf("%s = %d, want %d", tt.name, tt.got, tt.want)
+		}
+	}
 }

@@ -648,9 +648,13 @@ func TestEndpointWithTransportConfig(t *testing.T) {
 	ctx := context.Background()
 	const keepAlive = 2 * time.Second
 	const idle = 9 * time.Second
+	const initialPacketSize = 1200
+	const maxIncomingStreams = 64
 	ep, err := Bind(ctx, WithTransportConfig(&QUICTransportConfig{
-		KeepAlivePeriod: keepAlive,
-		MaxIdleTimeout:  idle,
+		KeepAlivePeriod:    keepAlive,
+		MaxIdleTimeout:     idle,
+		InitialPacketSize:  initialPacketSize,
+		MaxIncomingStreams: maxIncomingStreams,
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -661,6 +665,12 @@ func TestEndpointWithTransportConfig(t *testing.T) {
 	}
 	if ep.quicConf.MaxIdleTimeout != idle {
 		t.Fatalf("MaxIdleTimeout = %v, want %v", ep.quicConf.MaxIdleTimeout, idle)
+	}
+	if ep.quicConf.InitialPacketSize != initialPacketSize {
+		t.Fatalf("InitialPacketSize = %d, want %d", ep.quicConf.InitialPacketSize, initialPacketSize)
+	}
+	if ep.quicConf.MaxIncomingStreams != maxIncomingStreams {
+		t.Fatalf("MaxIncomingStreams = %d, want %d", ep.quicConf.MaxIncomingStreams, maxIncomingStreams)
 	}
 }
 

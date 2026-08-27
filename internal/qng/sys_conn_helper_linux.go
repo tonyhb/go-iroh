@@ -95,6 +95,12 @@ func appendUDPSegmentSizeMsg(b []byte, size uint16) []byte {
 	return b
 }
 
+// isGSOError reports whether err is the kernel refusing a segmented write.
+//
+// The match has to see through wrapping: the error arrives inside a
+// *net.OpError, so errors.As is load-bearing. A type assertion here would fail
+// open — GSO would stay enabled, the one-datagram-at-a-time resend below would
+// never run, and the datagrams would leave no trace in any counter.
 func isGSOError(err error) bool {
 	var serr *os.SyscallError
 	if errors.As(err, &serr) {

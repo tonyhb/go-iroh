@@ -1,6 +1,7 @@
 package blobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -33,7 +34,7 @@ func TestDownloaderFailover(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{bad, good}); err != nil {
+	if _, err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{bad, good}); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	if got := store.blobs[hash]; string(got) != string(data) {
@@ -74,10 +75,10 @@ func TestDownloaderReusesConnection(t *testing.T) {
 	d := NewDownloader(store, conn, DownloaderOptions{Concurrency: 1})
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := d.Download(context.Background(), firstHash, []netaddr.EndpointAddr{addr}); err != nil {
+	if _, err := d.Download(context.Background(), firstHash, []netaddr.EndpointAddr{addr}); err != nil {
 		t.Fatalf("first Download: %v", err)
 	}
-	if err := d.Download(context.Background(), secondHash, []netaddr.EndpointAddr{addr}); err != nil {
+	if _, err := d.Download(context.Background(), secondHash, []netaddr.EndpointAddr{addr}); err != nil {
 		t.Fatalf("second Download: %v", err)
 	}
 	if conn.connects[addr.String()] != 1 {
@@ -103,7 +104,7 @@ func TestDownloaderConcurrentFailover(t *testing.T) {
 	d := NewDownloader(store, conn, DownloaderOptions{Concurrency: 2})
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{one, two}); err != nil {
+	if _, err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{one, two}); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	if got := store.blobs[hash]; string(got) != string(data) {
@@ -137,7 +138,7 @@ func TestDownloaderConcurrentOnEvent(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = d.Close() })
 
-	if err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{one, two}); err != nil {
+	if _, err := d.Download(context.Background(), hash, []netaddr.EndpointAddr{one, two}); err != nil {
 		t.Fatalf("Download: %v", err)
 	}
 	if len(events) == 0 {
@@ -150,16 +151,32 @@ type downloadStore struct {
 	blobs map[Hash][]byte
 }
 
-func (s *downloadStore) Add(data []byte) (Hash, error) {
-	hash := NewHash(data)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.blobs == nil {
-		s.blobs = make(map[Hash][]byte)
-	}
-	s.blobs[hash] = append([]byte(nil), data...)
-	return hash, nil
+func (s *downloadStore) NewBlob(context.Context) (BlobWriter, error) {
+	return &downloadStoreWriter{store: s}, nil
 }
+
+type downloadStoreWriter struct {
+	store *downloadStore
+	buf   bytes.Buffer
+	done  bool
+}
+
+func (w *downloadStoreWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+
+func (w *downloadStoreWriter) Commit() (*TempTag, error) {
+	data := w.buf.Bytes()
+	hash := NewHash(data)
+	w.store.mu.Lock()
+	defer w.store.mu.Unlock()
+	if w.store.blobs == nil {
+		w.store.blobs = make(map[Hash][]byte)
+	}
+	w.store.blobs[hash] = append([]byte(nil), data...)
+	w.done = true
+	return &TempTag{value: RawHash(hash)}, nil
+}
+
+func (w *downloadStoreWriter) Close() error { w.done = true; return nil }
 
 type fakeBlobConnector struct {
 	mu       sync.Mutex
@@ -206,10 +223,11 @@ func (c *fakeBlobConn) OpenStreamSync(ctx context.Context) (BidiStream, error) {
 
 	client, server := newTestBidiStreamPair()
 	go func() {
-		_ = ServeBlob(ctx, server, StoreFunc(func(hash Hash) ([]byte, bool) {
-			data, ok := blobs[hash]
-			return append([]byte(nil), data...), ok
-		}))
+		store, err := NewMemStore(mapValues(blobs)...)
+		if err != nil {
+			return
+		}
+		_ = ServeBlob(ctx, server, store)
 	}()
 	return client, nil
 }
@@ -227,4 +245,12 @@ func testEndpointAddr(seed byte) netaddr.EndpointAddr {
 	b[0] = seed
 	id := key.NewSecretKey(b).Public().EndpointID()
 	return netaddr.NewEndpointAddr(id)
+}
+
+func mapValues(m map[Hash][]byte) [][]byte {
+	out := make([][]byte, 0, len(m))
+	for _, v := range m {
+		out = append(out, v)
+	}
+	return out
 }

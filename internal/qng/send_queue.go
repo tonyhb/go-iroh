@@ -2,6 +2,7 @@ package quic
 
 import (
 	"net"
+	"sync/atomic"
 
 	"github.com/tmc/go-iroh/internal/qng/internal/protocol"
 )
@@ -27,6 +28,7 @@ type sendQueue struct {
 	runStopped  chan struct{} // runStopped when the run loop returns
 	available   chan struct{}
 	conn        sendConn
+	pending     atomic.Int32
 }
 
 var _ sender = &sendQueue{}
@@ -48,12 +50,13 @@ func newSendQueue(conn sendConn) sender {
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
 // Otherwise Send will panic.
 func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
-	if gsoSize == 0 && len(p.Data) <= sendQueueInlinePacketSize && len(h.queue) == 0 {
+	if gsoSize == 0 && len(p.Data) <= sendQueueInlinePacketSize && h.pending.Load() == 0 {
 		if err := h.conn.Write(p.Data, gsoSize, ecn); err == nil || isSendMsgSizeErr(err) {
 			p.Release()
 			return
 		}
 	}
+	h.pending.Add(1)
 	select {
 	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
 		// clear available channel if we've reached capacity
@@ -64,7 +67,9 @@ func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
 			}
 		}
 	case <-h.runStopped:
+		h.pending.Add(-1)
 	default:
+		h.pending.Add(-1)
 		panic("sendQueue.Send would have blocked")
 	}
 }
@@ -104,6 +109,7 @@ func (h *sendQueue) Run() error {
 				}
 			}
 			e.buf.Release()
+			h.pending.Add(-1)
 			select {
 			case h.available <- struct{}{}:
 			default:

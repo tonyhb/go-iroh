@@ -42,7 +42,8 @@ type sconn struct {
 	// wroteFirstPacket fields and the oob scratch buffer, so writes must not
 	// overlap. The mutex is uncontended on the common path and is never held
 	// across a blocking operation.
-	writeMu sync.Mutex
+	writeMu     sync.Mutex
+	performance sendConnPerformanceCounters
 
 	// If GSO enabled, and we receive a GSO error for this remote address, GSO is disabled.
 	gotGSOError bool
@@ -63,10 +64,6 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 		}
 	}
 
-	oob := info.OOB()
-	// increase oob slice capacity, so we can add the UDP_SEGMENT and ECN control messages without allocating
-	l := len(oob)
-	oob = append(oob, make([]byte, 64)...)[:l]
 	sc := &sconn{
 		rawConn:   c,
 		localAddr: localAddr,
@@ -74,7 +71,7 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 	}
 	sc.remoteAddrInfo.Store(&remoteAddrInfo{
 		addr: remote,
-		oob:  oob,
+		oob:  packetInfoOOB(info),
 	})
 	return sc
 }
@@ -112,6 +109,9 @@ func (c *sconn) writePacket(p []byte, addr net.Addr, oob []byte, gsoSize uint16,
 		_, err = c.WritePacket(p, addr, oob, gsoSize, ecn)
 	}
 	c.wroteFirstPacket = true
+	if err == nil {
+		c.performance.recordWrite(len(p), gsoSize)
+	}
 	return err
 }
 
@@ -140,8 +140,15 @@ func (c *sconn) capabilities() connCapabilities {
 func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
 	c.remoteAddrInfo.Store(&remoteAddrInfo{
 		addr: addr,
-		oob:  info.OOB(),
+		oob:  packetInfoOOB(info),
 	})
+}
+
+func packetInfoOOB(info packetInfo) []byte {
+	oob := info.OOB()
+	// Reserve space for UDP_SEGMENT and ECN control messages.
+	n := len(oob)
+	return append(oob, make([]byte, 64)...)[:n]
 }
 
 func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }

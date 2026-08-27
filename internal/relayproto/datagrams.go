@@ -12,6 +12,7 @@ type Datagrams struct {
 	SegmentSize uint16
 	// Contents holds the datagram bytes.
 	Contents []byte
+	buf      *[]byte
 }
 
 // DatagramsFromBytes wraps b as a single (non-batch) datagram.
@@ -70,4 +71,21 @@ func datagramsFromBytesCopy(b []byte, isBatch, copyContents bool) (Datagrams, er
 		b = bytes.Clone(b)
 	}
 	return Datagrams{Ecn: ecn, SegmentSize: segSize, Contents: b}, nil
+}
+
+// Pooled returns a copy of d whose Contents live in a pooled buffer. Call
+// Release when done with it.
+func (d Datagrams) Pooled() Datagrams {
+	p := GetBuf(len(d.Contents))
+	copy(*p, d.Contents)
+	d.Contents = *p
+	d.buf = p
+	return d
+}
+
+// Release returns a buffer obtained via Pooled. It is a no-op otherwise.
+func (d Datagrams) Release() {
+	if d.buf != nil {
+		PutBuf(d.buf)
+	}
 }

@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/tmc/go-iroh/internal/qng/internal/congestion"
@@ -110,6 +111,11 @@ type appDataPath struct {
 	ecnTracker ecnHandler
 }
 
+type pathRef struct {
+	id protocol.PathID
+	p  *appDataPath
+}
+
 type sentPacketHandler struct {
 	initialPackets   *packetNumberSpace
 	handshakePackets *packetNumberSpace
@@ -118,6 +124,8 @@ type sentPacketHandler struct {
 	// are opened (Stage 5). With multipath off it stays single-entry, making
 	// the path map a behavioral no-op.
 	appDataPaths map[protocol.PathID]*appDataPath
+	// pathList mirrors appDataPaths for the per-packet fan-out loops.
+	pathList []pathRef
 
 	// Do we know that the peer completed address validation yet?
 	// Always true for the server.
@@ -210,6 +218,7 @@ func NewSentPacketHandler(
 		appDataPaths: map[protocol.PathID]*appDataPath{
 			protocol.PathIDZero: path0,
 		},
+		pathList:               []pathRef{{protocol.PathIDZero, path0}},
 		rttStats:               rttStats,
 		connStats:              connStats,
 		congestion:             congestion,
@@ -269,6 +278,7 @@ func (h *sentPacketHandler) RemovePath(pid protocol.PathID) {
 		return
 	}
 	delete(h.appDataPaths, pid)
+	h.pathList = slices.DeleteFunc(h.pathList, func(r pathRef) bool { return r.id == pid })
 }
 
 func (h *sentPacketHandler) addPath(pid protocol.PathID) error {
@@ -292,6 +302,7 @@ func (h *sentPacketHandler) addPath(pid protocol.PathID) error {
 		path.ecnTracker = newECNTracker(h.logger, h.qlogger)
 	}
 	h.appDataPaths[pid] = path
+	h.pathList = append(h.pathList, pathRef{pid, path})
 	return nil
 }
 
@@ -330,8 +341,8 @@ func (h *sentPacketHandler) bytesInFlightForPacket(p *packet) *protocol.ByteCoun
 // flat h.bytesInFlight.
 func (h *sentPacketHandler) totalBytesInFlight() protocol.ByteCount {
 	total := h.bytesInFlight
-	for _, p := range h.appDataPaths {
-		total += p.bytesInFlight
+	for _, r := range h.pathList {
+		total += r.p.bytesInFlight
 	}
 	return total
 }
@@ -426,8 +437,8 @@ func (h *sentPacketHandler) ReceivedPacketForPath(pid protocol.PathID, size prot
 
 func (h *sentPacketHandler) packetsInFlight() int {
 	var packetsInFlight int
-	for _, p := range h.appDataPaths {
-		packetsInFlight += p.space.history.NumOutstanding()
+	for _, r := range h.pathList {
+		packetsInFlight += r.p.space.history.NumOutstanding()
 	}
 	if h.handshakePackets != nil {
 		packetsInFlight += h.handshakePackets.history.NumOutstanding()
@@ -1047,11 +1058,11 @@ func (h *sentPacketHandler) getLossTimeAndSpace() (monotime.Time, protocol.Encry
 	// Fan out over the application-data paths, recording which path owns the
 	// earliest loss time. With one path (PathIDZero) this is the same comparison
 	// against the single appData lossTime as before, and pid stays PathIDZero.
-	for id, p := range h.appDataPaths {
-		if lossTime.IsZero() || (!p.space.lossTime.IsZero() && p.space.lossTime.Before(lossTime)) {
-			lossTime = p.space.lossTime
+	for _, r := range h.pathList {
+		if lossTime.IsZero() || (!r.p.space.lossTime.IsZero() && r.p.space.lossTime.Before(lossTime)) {
+			lossTime = r.p.space.lossTime
 			encLevel = protocol.Encryption1RTT
-			pid = id
+			pid = r.id
 		}
 	}
 	return lossTime, encLevel, pid
@@ -1103,7 +1114,8 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 	// Fan out over the application-data paths. With one path (PathIDZero) this
 	// is the same single appData PTO computation as before.
 	if h.handshakeConfirmed {
-		for pathID, p := range h.appDataPaths {
+		for _, r := range h.pathList {
+			p := r.p
 			if !p.space.history.HasOutstandingPackets() || p.space.lastAckElicitingPacketTime.IsZero() {
 				continue
 			}
@@ -1111,7 +1123,7 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 			if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
 				pto = t
 				encLevel = protocol.Encryption1RTT
-				pid = pathID
+				pid = r.id
 			}
 		}
 	}
@@ -1510,8 +1522,8 @@ func (h *sentPacketHandler) SendModeForPath(now monotime.Time, pid protocol.Path
 	}
 
 	var numTrackedPackets int
-	for _, p := range h.appDataPaths {
-		numTrackedPackets += p.space.history.Len()
+	for _, r := range h.pathList {
+		numTrackedPackets += r.p.space.history.Len()
 	}
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()

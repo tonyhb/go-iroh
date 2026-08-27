@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tmc/go-iroh/key"
@@ -244,6 +245,13 @@ type RemoteStateActor struct {
 	conns    map[Connection]*connState
 	selected *Addr
 	localNAT []netip.AddrPort
+
+	// noHolepunch suppresses upgrade-tick NAT traversal and direct-path
+	// validation. Set by RemoteMap at spawn (atomically, because the actor
+	// loop is already running) for endpoints without IP transports: there is
+	// no direct path to punch toward, and a traversal round initiated on a
+	// relay-only connection stalls its in-flight relay streams.
+	noHolepunch atomic.Bool
 }
 
 // newRemoteStateActor creates and starts an actor for id. The returned actor is
@@ -368,12 +376,27 @@ func (a *RemoteStateActor) run(ctx context.Context) {
 		case <-heartbeat.C:
 			a.reselect()
 		case <-upgrade.C:
-			// Upgrade tick: first ask qng to validate a direct RFC 9000 path, then
-			// try a QNT round when the active connection supports it. Errors are
-			// non-fatal; the actor keeps using the best path it already knows and
-			// tries again on the next cadence.
-			_ = a.ValidateDirectPath(context.Background())
-			_ = a.TriggerHolepunch()
+			// Upgrade tick: fallback behind the punch-on-ready trigger.
+			// Direct selected: nothing to upgrade toward. Relay selected:
+			// only a punch can help — ValidateDirectPath opens a path over
+			// the current four-tuple (the relay itself) and just burns its
+			// timeout. Off-loop: they block for seconds and the actor must
+			// keep processing messages.
+			sel, selected := a.SelectedPath()
+			switch {
+			case a.noHolepunch.Load():
+				// No IP transports: there is no direct path to upgrade
+				// toward, and a traversal round on a relay-only connection
+				// stalls its in-flight relay streams.
+			case selected && sel.Kind() == AddrIP:
+			case selected && sel.Kind() == AddrRelay:
+				go func() { _ = a.TriggerHolepunch() }()
+			default:
+				go func() {
+					_ = a.ValidateDirectPath(context.Background())
+					_ = a.TriggerHolepunch()
+				}()
+			}
 			a.reselect()
 		}
 		// Keep the idle timer disarmed (reset to a fresh full timeout) while
@@ -850,6 +873,32 @@ func (a *RemoteStateActor) TriggerHolepunch() error {
 	if target == nil {
 		return ErrExtensionNotNegotiated
 	}
+	return a.triggerHolepunch(target, candidates)
+}
+
+// TriggerHolepunchConn attempts NAT traversal on conn. It returns
+// [context.Canceled] if conn is no longer registered, or
+// [ErrExtensionNotNegotiated] if conn does not support QNT.
+func (a *RemoteStateActor) TriggerHolepunchConn(conn Connection) error {
+	a.mu.Lock()
+	_, registered := a.conns[conn]
+	candidates := append([]netip.AddrPort(nil), a.localNAT...)
+	a.mu.Unlock()
+	if !registered {
+		return context.Canceled
+	}
+	mp, ok := conn.(multipathConnection)
+	if !ok || !mp.MultipathNegotiated() {
+		return ErrExtensionNotNegotiated
+	}
+	target, ok := conn.(natTraversalRoundConnection)
+	if !ok {
+		return ErrExtensionNotNegotiated
+	}
+	return a.triggerHolepunch(target, candidates)
+}
+
+func (a *RemoteStateActor) triggerHolepunch(target natTraversalRoundConnection, candidates []netip.AddrPort) error {
 	if a.metrics != nil {
 		a.metrics.holepunchAttempts.Add(1)
 	}
@@ -906,6 +955,13 @@ func (a *RemoteStateActor) PathInfos(conn Connection) []PathInfo {
 	infos := make([]PathInfo, 0, len(open))
 	byAddr := make(map[string]int, len(open))
 	for _, addr := range open {
+		// cs.addr and cs.paths overlap whenever qng validates a path whose
+		// address is the connection's own, so open can name one address twice.
+		// Reporting it twice yields two entries that both look selected, and
+		// only the last one receives the multipath stats merged in below.
+		if _, dup := byAddr[addr.String()]; dup {
+			continue
+		}
 		info := PathInfo{
 			Validated: true,
 			Addr:      addr,

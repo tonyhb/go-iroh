@@ -236,6 +236,9 @@ type Conn struct {
 	observedAddrSeqNo  uint64
 	observedAddrValid  bool
 	observedAddrSeqSet bool
+	// observedAddrReadyCh is closed at the first report so a reader can wait
+	// instead of polling; created lazily under observedAddrMu.
+	observedAddrReadyCh chan struct{}
 
 	streamsMap      *streamsMap
 	connIDManager   *connIDManager
@@ -318,6 +321,8 @@ type Conn struct {
 	keepAliveInterval time.Duration
 
 	datagramQueue *datagramQueue
+
+	performance performanceCounters
 
 	connStateMutex sync.Mutex
 	connState      ConnectionState
@@ -3233,10 +3238,14 @@ func (c *Conn) handleObservedAddrFrame(frame *wire.ObservedAddrFrame) error {
 		// Stale or duplicate report; ignore (paths.rs:621-622).
 		return nil
 	}
+	first := !c.observedAddrValid
 	c.observedAddrSeqNo = frame.SeqNo
 	c.observedAddrSeqSet = true
 	c.observedAddr = netip.AddrPortFrom(frame.Addr.Unmap(), frame.Port)
 	c.observedAddrValid = true
+	if first {
+		close(c.observedAddrReadyLocked())
+	}
 	return nil
 }
 
@@ -3280,8 +3289,55 @@ func (c *Conn) ObservedAddr() (netip.AddrPort, bool) {
 	return c.observedAddr, true
 }
 
+// observedAddrReadyLocked returns the channel closed on the first report,
+// creating it on demand. observedAddrMu must be held.
+func (c *Conn) observedAddrReadyLocked() chan struct{} {
+	if c.observedAddrReadyCh == nil {
+		c.observedAddrReadyCh = make(chan struct{})
+	}
+	return c.observedAddrReadyCh
+}
+
+// AwaitObservedAddr returns the reflexive address the peer reported via the
+// QUIC Address Discovery OBSERVED_ADDRESS extension, waiting for the first
+// report if none has arrived yet (reports are sent after the handshake, so an
+// immediate read misses). Returns ok=false without waiting when address
+// discovery was not negotiated to receive reports, and when ctx ends or the
+// connection closes first.
+func (c *Conn) AwaitObservedAddr(ctx context.Context) (netip.AddrPort, bool) {
+	c.observedAddrMu.Lock()
+	if c.observedAddrValid {
+		addr := c.observedAddr
+		c.observedAddrMu.Unlock()
+		return addr, true
+	}
+	ready := c.observedAddrReadyLocked()
+	c.observedAddrMu.Unlock()
+
+	if !c.acceptsObservedAddr() {
+		return netip.AddrPort{}, false
+	}
+	select {
+	case <-ready:
+		return c.ObservedAddr()
+	case <-ctx.Done():
+		return netip.AddrPort{}, false
+	case <-c.Context().Done():
+		return netip.AddrPort{}, false
+	}
+}
+
 func (c *Conn) triggerSending(now monotime.Time) error {
 	c.pacingDeadline = 0
+
+	// Queue a connection-level window update before consulting the send mode:
+	// SendAck / SendPacingLimited produce ack-only packets, which carry
+	// queued control frames but never call GetWindowUpdate themselves. A
+	// congestion-limited pure sink must still grant MAX_DATA, or it starves
+	// its sender of flow-control credit and the transfer deadlocks.
+	if offset := c.connFlowController.GetWindowUpdate(now); offset > 0 {
+		c.framer.QueueMaxDataFrame(offset)
+	}
 
 	sendMode := c.sentPacketHandler.SendMode(now)
 	switch sendMode {
@@ -3321,6 +3377,7 @@ func (c *Conn) triggerSending(now monotime.Time) error {
 }
 
 func (c *Conn) sendPackets(now monotime.Time) error {
+	c.performance.recordSendLoop()
 	if c.perspective == protocol.PerspectiveClient && c.handshakeConfirmed {
 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
 			connID, frame, tr, ok := pm.NextPathToProbe()
@@ -3378,9 +3435,6 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 		return nil
 	}
 
-	if offset := c.connFlowController.GetWindowUpdate(now); offset > 0 {
-		c.framer.QueueMaxDataFrame(offset)
-	}
 	if cf := c.cryptoStreamManager.GetPostHandshakeData(protocol.MaxPostHandshakeCryptoFrameSize); cf != nil {
 		c.queueControlFrame(cf)
 	}
@@ -3425,7 +3479,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 	for {
 		buf := getPacketBuffer()
 		ecn := c.sentPacketHandler.ECNMode(true)
-		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
+		if _, _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
 				return nil
@@ -3458,13 +3512,13 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 }
 
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
-	buf := getLargePacketBuffer()
+	buf := getPacketBuffer()
 	maxSize := c.maxPacketSize()
 
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
 		var dontSendMore bool
-		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
+		size, hasDatagram, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
 		if err != nil {
 			if err != errNothingToPack {
 				return err
@@ -3474,6 +3528,30 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 				return nil
 			}
 			dontSendMore = true
+		}
+		if err == nil && hasDatagram {
+			c.sendQueue.Send(buf, 0, ecn)
+			if c.sendQueue.WouldBlock() {
+				return nil
+			}
+			sendMode := c.sentPacketHandler.SendMode(now)
+			if sendMode == ackhandler.SendPacingLimited {
+				c.resetPacingDeadline()
+				return nil
+			}
+			if sendMode != ackhandler.SendAny {
+				return nil
+			}
+			c.receivedPacketMx.Lock()
+			hasPackets := !c.receivedPackets.Empty()
+			c.receivedPacketMx.Unlock()
+			if hasPackets {
+				c.pacingDeadline = deadlineSendImmediately
+				return nil
+			}
+			buf = getPacketBuffer()
+			ecn = c.sentPacketHandler.ECNMode(true)
+			continue
 		}
 
 		if !dontSendMore {
@@ -3494,11 +3572,23 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		// 2. The last packet appended was a full-size packet
 		// 3. The next packet will have the same ECN marking
 		// 4. We still have enough space for another full-size packet in the buffer
-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
-			continue
+		if !dontSendMore && size == maxSize && nextECN == ecn {
+			if buf.Len()+maxSize > buf.Cap() {
+				large := getLargePacketBuffer()
+				large.Data = append(large.Data, buf.Data...)
+				buf.Release()
+				buf = large
+			}
+			if buf.Len()+maxSize <= buf.Cap() {
+				continue
+			}
 		}
 
-		c.sendQueue.Send(buf, uint16(maxSize), ecn)
+		gsoSize := uint16(0)
+		if buf.Len() > maxSize {
+			gsoSize = uint16(maxSize)
+		}
+		c.sendQueue.Send(buf, gsoSize, ecn)
 
 		if dontSendMore {
 			return nil
@@ -3517,7 +3607,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		}
 
 		ecn = nextECN
-		buf = getLargePacketBuffer()
+		buf = getPacketBuffer()
 	}
 }
 
@@ -3597,19 +3687,29 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 
 // appendOneShortHeaderPacket appends a new packet to the given packetBuffer.
 // If there was nothing to pack, the returned size is 0.
-func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.ByteCount, ecn protocol.ECN, now monotime.Time) (protocol.ByteCount, error) {
+func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.ByteCount, ecn protocol.ECN, now monotime.Time) (protocol.ByteCount, bool, error) {
 	startLen := buf.Len()
 	p, err := c.packer.AppendPacket(buf, maxSize, now, c.version)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	size := buf.Len() - startLen
 	c.logShortHeaderPacket(p, ecn, size)
 	c.registerPackedShortHeaderPacket(p, ecn, now)
-	return size, nil
+	return size, packetHasDatagram(p), nil
+}
+
+func packetHasDatagram(p shortHeaderPacket) bool {
+	for _, f := range p.Frames {
+		if _, ok := f.Frame.(*wire.DatagramFrame); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol.ECN, now monotime.Time) {
+	c.performance.recordPacket(p)
 	if p.IsPathProbePacket {
 		c.sentPacketHandler.SentPacket(
 			now,
@@ -3910,6 +4010,7 @@ func (c *Conn) queueControlFrame(f wire.Frame) {
 func (c *Conn) onHasConnectionData() { c.scheduleSending() }
 
 func (c *Conn) onHasStreamData(id protocol.StreamID, str *SendStream) {
+	c.performance.recordStreamActivation()
 	c.framer.AddActiveStream(id, str)
 	c.scheduleSending()
 }

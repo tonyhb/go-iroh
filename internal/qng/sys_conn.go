@@ -26,6 +26,8 @@ type connCapabilities struct {
 	ECN bool
 }
 
+const minGSOSegments = 4
+
 // rawConn is a connection that allow reading of a receivedPackeh.
 type rawConn interface {
 	ReadPacket() (receivedPacket, error)
@@ -48,6 +50,14 @@ type OOBCapablePacketConn interface {
 	SyscallConn() (syscall.RawConn, error)
 	SetReadBuffer(int) error
 	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+}
+
+// gsoCapablePacketConn can send UDP_SEGMENT messages without changing the
+// connection's receive path.
+type gsoCapablePacketConn interface {
+	net.PacketConn
+	SyscallConn() (syscall.RawConn, error)
 	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
 }
 
@@ -100,11 +110,20 @@ func wrapConn(pc net.PacketConn) (rawConn, error) {
 		}
 	}
 	c, ok := pc.(OOBCapablePacketConn)
-	if !ok {
-		utils.DefaultLogger.Infof("PacketConn is not a net.UDPConn. Disabling optimizations possible on UDP connections.")
-		return &basicConn{PacketConn: pc, supportsDF: supportsDF}, nil
+	if ok {
+		return newConn(c, supportsDF)
 	}
-	return newConn(c, supportsDF)
+	if c, ok := pc.(gsoCapablePacketConn); ok {
+		conn, enabled, err := newGSOSendConn(c, supportsDF)
+		if err != nil {
+			return nil, err
+		}
+		if enabled {
+			return conn, nil
+		}
+	}
+	utils.DefaultLogger.Infof("PacketConn is not a net.UDPConn. Disabling optimizations possible on UDP connections.")
+	return &basicConn{PacketConn: pc, supportsDF: supportsDF}, nil
 }
 
 // The basicConn is the most trivial implementation of a rawConn.

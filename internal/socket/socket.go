@@ -24,12 +24,12 @@ type Socket struct {
 	endpointAddrs *AddrMap[key.EndpointID, EndpointIDMappedAddr]
 
 	// relayAddrs maps (relay url, endpoint id) pairs to relay mapped addresses.
-	// The map key is the relay key's string form, because netaddr.RelayURL wraps a
-	// pointer and is not reliably comparable across separately-parsed URLs.
-	relayAddrs *AddrMap[string, RelayMappedAddr]
-	// relayByKey recovers the original RelayKey from its string form.
+	// Keyed by the URL's string form because netaddr.RelayURL wraps a pointer
+	// and is not reliably comparable across separately-parsed URLs.
+	relayAddrs *AddrMap[relayMapKey, RelayMappedAddr]
+	// relayByKey recovers the original RelayKey.
 	relayMu    sync.Mutex
-	relayByKey map[string]RelayKey
+	relayByKey map[relayMapKey]RelayKey
 
 	// customAddrs maps a custom address (by its string key) to a custom mapped
 	// address.
@@ -41,10 +41,9 @@ type Socket struct {
 	closed atomic.Bool
 }
 
-// relayKeyString renders a relay key as a stable map key. netaddr.RelayURL
-// normalizes its string form, so equivalent URLs collapse to one key.
-func relayKeyString(url netaddr.RelayURL, eid key.EndpointID) string {
-	return url.String() + "|" + eid.String()
+type relayMapKey struct {
+	url string
+	eid key.EndpointID
 }
 
 // RelayKey identifies a relay path: a relay URL together with the remote
@@ -62,11 +61,11 @@ func NewSocket() *Socket {
 			NewEndpointIDMappedAddr,
 			func(v EndpointIDMappedAddr) netip.Addr { return v.Addr() },
 		),
-		relayAddrs: NewAddrMap[string, RelayMappedAddr](
+		relayAddrs: NewAddrMap[relayMapKey, RelayMappedAddr](
 			NewRelayMappedAddr,
 			func(v RelayMappedAddr) netip.Addr { return v.Addr() },
 		),
-		relayByKey: make(map[string]RelayKey),
+		relayByKey: make(map[relayMapKey]RelayKey),
 		customAddrs: NewAddrMap[string, CustomMappedAddr](
 			NewCustomMappedAddr,
 			func(v CustomMappedAddr) netip.Addr { return v.Addr() },
@@ -98,9 +97,11 @@ func (s *Socket) LookupEndpointID(m EndpointIDMappedAddr) (key.EndpointID, bool)
 // RelayMappedAddrFor returns the relay mapped address for the (url, eid) pair,
 // allocating one on first use.
 func (s *Socket) RelayMappedAddrFor(url netaddr.RelayURL, eid key.EndpointID) RelayMappedAddr {
-	key := relayKeyString(url, eid)
+	key := relayMapKey{url.String(), eid}
 	s.relayMu.Lock()
-	s.relayByKey[key] = RelayKey{URL: url, EID: eid}
+	if _, ok := s.relayByKey[key]; !ok {
+		s.relayByKey[key] = RelayKey{URL: url, EID: eid}
+	}
 	s.relayMu.Unlock()
 	return s.relayAddrs.Get(key)
 }
@@ -151,6 +152,42 @@ func (s *Socket) PathAddr(remoteID key.EndpointID, ra net.Addr) Addr {
 		return IPAddr(ap)
 	default:
 		return IPAddr(ap)
+	}
+}
+
+// EvictRemote drops the mapped addresses recorded for a reaped remote: the
+// endpoint-id mapping for id, every relay mapping whose remote endpoint is id,
+// and the custom mappings among addrs (the remote's known transport
+// addresses). Without eviction the tables grow without bound under peer churn
+// (the upstream Rust implementation has the same leak, iroh issue #4293). A
+// mapping is regenerated on the next use of the same key, so evicting a remote
+// that immediately returns only costs a fresh mapped address.
+func (s *Socket) EvictRemote(id key.EndpointID, addrs []Addr) {
+	s.endpointAddrs.Remove(id)
+
+	s.relayMu.Lock()
+	var relayKeys []relayMapKey
+	for k, rk := range s.relayByKey {
+		if rk.EID == id {
+			relayKeys = append(relayKeys, k)
+			delete(s.relayByKey, k)
+		}
+	}
+	s.relayMu.Unlock()
+	for _, k := range relayKeys {
+		s.relayAddrs.Remove(k)
+	}
+
+	for _, a := range addrs {
+		c, ok := a.Custom()
+		if !ok {
+			continue
+		}
+		k := c.String()
+		s.customMu.Lock()
+		delete(s.customByKey, k)
+		s.customMu.Unlock()
+		s.customAddrs.Remove(k)
 	}
 }
 

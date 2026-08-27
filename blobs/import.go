@@ -49,7 +49,7 @@ func (s *FSStore) importFileCopy(path string) (Hash, error) {
 	}
 	defer src.Close()
 
-	dataTmp, err := os.CreateTemp(s.dataDir, ".import-data-*")
+	dataTmp, err := os.CreateTemp(s.dataDir, importTempPrefix+"*")
 	if err != nil {
 		return Hash{}, fmt.Errorf("blobs: create import data: %w", err)
 	}
@@ -62,11 +62,12 @@ func (s *FSStore) importFileCopy(path string) (Hash, error) {
 		dataTmp.Close()
 		return Hash{}, fmt.Errorf("blobs: rewind import data: %w", err)
 	}
-	return s.finishImport(dataTmp, true)
+	hash, _, err := s.finishImport(dataTmp, true, false)
+	return hash, err
 }
 
 func (s *FSStore) importFileLink(path string) (Hash, error) {
-	dataTmp, err := os.CreateTemp(s.dataDir, ".import-data-*")
+	dataTmp, err := os.CreateTemp(s.dataDir, importTempPrefix+"*")
 	if err != nil {
 		return Hash{}, fmt.Errorf("blobs: create import data: %w", err)
 	}
@@ -87,19 +88,28 @@ func (s *FSStore) importFileLink(path string) (Hash, error) {
 		return Hash{}, fmt.Errorf("blobs: open linked import data: %w", err)
 	}
 	defer removeTemp(dataTmpName)
-	return s.finishImport(dataTmp, false)
+	hash, _, err := s.finishImport(dataTmp, false, false)
+	return hash, err
 }
 
-func (s *FSStore) finishImport(dataTmp *os.File, syncData bool) (Hash, error) {
+// finishImport encodes the outboard for dataTmp and installs both files under
+// the content's root hash.
+//
+// When protect is set, finishImport returns a [TempTag] naming the blob, created
+// under the same lock that installs it. Holding s.mu across both is what makes
+// the blob unreachable by [FSStore.GC] before it is protected: GC claims a
+// deletion under the same lock, so it either runs entirely before the install,
+// finding nothing, or entirely after, finding the tag.
+func (s *FSStore) finishImport(dataTmp *os.File, syncData, protect bool) (Hash, *TempTag, error) {
 	info, err := dataTmp.Stat()
 	if err != nil {
 		dataTmp.Close()
-		return Hash{}, fmt.Errorf("blobs: stat import data: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: stat import data: %w", err)
 	}
 	outTmp, err := os.CreateTemp(s.baoDir, ".import-outboard-*")
 	if err != nil {
 		dataTmp.Close()
-		return Hash{}, fmt.Errorf("blobs: create import outboard: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: create import outboard: %w", err)
 	}
 	defer removeTemp(outTmp.Name())
 
@@ -107,43 +117,56 @@ func (s *FSStore) finishImport(dataTmp *os.File, syncData bool) (Hash, error) {
 	if err != nil {
 		outTmp.Close()
 		dataTmp.Close()
-		return Hash{}, fmt.Errorf("blobs: encode import outboard: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: encode import outboard: %w", err)
 	}
 	hash := Hash(root)
 	if syncData {
 		if err := dataTmp.Sync(); err != nil {
 			outTmp.Close()
 			dataTmp.Close()
-			return Hash{}, fmt.Errorf("blobs: sync import data: %w", err)
+			return Hash{}, nil, fmt.Errorf("blobs: sync import data: %w", err)
 		}
 	}
 	if err := outTmp.Sync(); err != nil {
 		outTmp.Close()
 		dataTmp.Close()
-		return Hash{}, fmt.Errorf("blobs: sync import outboard: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: sync import outboard: %w", err)
 	}
 	if err := dataTmp.Close(); err != nil {
 		outTmp.Close()
-		return Hash{}, fmt.Errorf("blobs: close import data: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: close import data: %w", err)
 	}
 	if err := outTmp.Close(); err != nil {
-		return Hash{}, fmt.Errorf("blobs: close import outboard: %w", err)
+		return Hash{}, nil, fmt.Errorf("blobs: close import outboard: %w", err)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if fileExists(s.dataPath(hash)) && fileExists(s.outboardPath(hash)) {
-		return hash, nil
+	if !fileExists(s.dataPath(hash)) || !fileExists(s.outboardPath(hash)) {
+		if err := os.Rename(dataTmp.Name(), s.dataPath(hash)); err != nil {
+			return Hash{}, nil, fmt.Errorf("blobs: install import data: %w", err)
+		}
+		if err := os.Rename(outTmp.Name(), s.outboardPath(hash)); err != nil {
+			_ = os.Remove(s.dataPath(hash))
+			return Hash{}, nil, fmt.Errorf("blobs: install import outboard: %w", err)
+		}
 	}
-	if err := os.Rename(dataTmp.Name(), s.dataPath(hash)); err != nil {
-		return Hash{}, fmt.Errorf("blobs: install import data: %w", err)
+	// Tag last, after every path that can fail. Creating it earlier would leave
+	// an entry in s.temp that nothing could release: the caller gets no handle
+	// on an error, and TempTag.Close takes s.mu, so it cannot be closed from
+	// here either. Atomicity is unaffected, since holding s.mu across the
+	// installs and the tag is the whole of the argument.
+	var tag *TempTag
+	if protect {
+		tag = s.newTempTagLocked(RawHash(hash))
 	}
-	if err := os.Rename(outTmp.Name(), s.outboardPath(hash)); err != nil {
-		_ = os.Remove(s.dataPath(hash))
-		return Hash{}, fmt.Errorf("blobs: install import outboard: %w", err)
-	}
-	return hash, nil
+	return hash, tag, nil
 }
+
+// importTempPrefix names in-flight import and write temporaries. It must not
+// parse as a [Hash]: [FSStore.GC] walks the data directory and skips names
+// that [ParseHash] rejects, which is what keeps uncommitted content alive.
+const importTempPrefix = ".import-data-"
 
 func removeTemp(name string) {
 	_ = os.Remove(name)

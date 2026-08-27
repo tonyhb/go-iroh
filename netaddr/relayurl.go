@@ -17,6 +17,7 @@ import (
 // [RelayURLFromURL].
 type RelayURL struct {
 	url *url.URL
+	s   string
 }
 
 // ParseRelayURL parses s into a RelayURL. It returns an error wrapping
@@ -33,7 +34,8 @@ func ParseRelayURL(s string) (RelayURL, error) {
 // that equivalent URLs compare equal (see [RelayURL.String]).
 func RelayURLFromURL(u *url.URL) RelayURL {
 	c := *u
-	return RelayURL{url: normalizeURL(&c)}
+	n := normalizeURL(&c)
+	return RelayURL{url: n, s: n.String()}
 }
 
 // ErrParseRelayURL is returned (wrapped) when a relay URL cannot be parsed.
@@ -51,12 +53,7 @@ func (r RelayURL) URL() *url.URL {
 // String returns the normalized string form of the URL. An empty path is
 // rendered as "/", matching the WHATWG URL serialization used by the Rust
 // reference implementation (e.g. "https://example.com" -> "https://example.com/").
-func (r RelayURL) String() string {
-	if r.url == nil {
-		return ""
-	}
-	return r.url.String()
-}
+func (r RelayURL) String() string { return r.s }
 
 // Host returns the host (without port) of the relay URL.
 func (r RelayURL) Host() string {

@@ -3,6 +3,7 @@ package socket
 import (
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 
 	"github.com/tmc/go-iroh/key"
@@ -169,6 +170,34 @@ func TestMagicConnUDPAddrCacheKeysIPv6Zone(t *testing.T) {
 	if cached := m.udpAddr(ap); cached != got {
 		t.Fatal("udpAddr did not reuse cached address")
 	}
+}
+
+// TestMagicConnUDPAddrCacheConcurrent checks that concurrent receives may
+// share the cache. It reports nothing on its own; run it under -race.
+func TestMagicConnUDPAddrCacheConcurrent(t *testing.T) {
+	m := &MagicConn{recvAddrs: make(map[netip.AddrPort]*net.UDPAddr)}
+	// Enough peers that the readers keep meeting first sightings, which is
+	// what puts a write next to a read.
+	peers := make([]netip.AddrPort, 64)
+	for i := range peers {
+		peers[i] = netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 0, byte(i / 256), byte(i)}), 4242)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				for _, ap := range peers {
+					if got := m.udpAddr(ap); got.AddrPort() != ap {
+						t.Errorf("udpAddr(%s) = %s", ap, got.AddrPort())
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestMappedAddrPrefixExact checks the literal first 8 bytes.

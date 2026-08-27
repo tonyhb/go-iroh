@@ -6,11 +6,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/tmc/go-iroh/dnsserver"
+	"github.com/tmc/go-iroh/internal/pprofserver"
+)
+
+const (
+	httpReadHeaderTimeout = 5 * time.Second
+	httpReadTimeout       = 10 * time.Second
+	httpWriteTimeout      = 10 * time.Second
+	httpIdleTimeout       = time.Minute
 )
 
 func main() {
@@ -25,15 +35,23 @@ func run(args []string) error {
 	fs.SetOutput(os.Stderr)
 	addr := fs.String("addr", ":3350", "listen address")
 	dnsAddr := fs.String("dns-addr", "", "UDP DNS listen address")
+	pprofAddr := fs.String("pprof-addr", "", "pprof HTTP listen address (disabled if empty)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
+	if *pprofAddr != "" {
+		profiler, err := pprofserver.Start(*pprofAddr, log.New(os.Stderr, "", log.LstdFlags))
+		if err != nil {
+			return err
+		}
+		defer profiler.Close()
+	}
 	server := dnsserver.New()
 	if *dnsAddr == "" {
-		return http.ListenAndServe(*addr, server)
+		return newHTTPServer(*addr, server).ListenAndServe()
 	}
 	pc, err := net.ListenPacket("udp", *dnsAddr)
 	if err != nil {
@@ -43,6 +61,17 @@ func run(args []string) error {
 
 	errc := make(chan error, 2)
 	go func() { errc <- server.ServePacketConn(context.Background(), pc) }()
-	go func() { errc <- http.ListenAndServe(*addr, server) }()
+	go func() { errc <- newHTTPServer(*addr, server).ListenAndServe() }()
 	return <-errc
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 }

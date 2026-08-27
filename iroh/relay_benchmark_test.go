@@ -9,6 +9,7 @@ import (
 	"github.com/tmc/go-iroh/key"
 	"github.com/tmc/go-iroh/netaddr"
 	"github.com/tmc/go-iroh/relay"
+	"github.com/tmc/go-iroh/relayserver"
 )
 
 func benchmarkRelayConnPair(b *testing.B, alpn string) (client, server *Conn) {
@@ -16,7 +17,7 @@ func benchmarkRelayConnPair(b *testing.B, alpn string) (client, server *Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	b.Cleanup(cancel)
 
-	srv := newEchoRelayServer(b)
+	srv := newEchoRelayServer(b, relayserver.WithClientRate(0))
 	relayURL := srv.url(b)
 	mode := relay.ModeCustom(relay.MapFromURLs(relayURL))
 
@@ -78,7 +79,7 @@ func BenchmarkRelayConnSetupLatency(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	srv := newEchoRelayServer(b)
+	srv := newEchoRelayServer(b, relayserver.WithClientRate(0))
 	relayURL := srv.url(b)
 	mode := relay.ModeCustom(relay.MapFromURLs(relayURL))
 
@@ -166,6 +167,7 @@ func BenchmarkRelayConnStreamThroughput(b *testing.B) {
 	buf := make([]byte, 64*1024)
 	b.SetBytes(int64(len(buf)))
 	b.ReportAllocs()
+	cpuStart := readBenchmarkCPUTime(b)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := s.Write(buf); err != nil {
@@ -173,6 +175,7 @@ func BenchmarkRelayConnStreamThroughput(b *testing.B) {
 		}
 	}
 	b.StopTimer()
+	reportCPUPerOp(b, cpuStart)
 	if err := s.Close(); err != nil {
 		b.Fatalf("close stream: %v", err)
 	}

@@ -202,8 +202,9 @@ func TestSendPathBufferUsesQNTRoute(t *testing.T) {
 	c := &Conn{sendQueue: s}
 	route := netip.MustParseAddrPort("[::ffff:198.51.100.7]:4433")
 	want := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 4433}
+	path := &pathOpenState{qntRoute: route}
 
-	c.sendPathBuffer(buf, protocol.ECNNon, &pathOpenState{qntRoute: route})
+	c.sendPathBuffer(buf, protocol.ECNNon, path)
 
 	if s.sends != 0 {
 		t.Fatalf("Send calls = %d, want 0", s.sends)
@@ -219,6 +220,9 @@ func TestSendPathBufferUsesQNTRoute(t *testing.T) {
 	}
 	if buf.refCount != 0 {
 		t.Fatalf("packet buffer refCount = %d, want 0 after synchronous route send", buf.refCount)
+	}
+	if path.qntUDPAddr == nil || !path.qntUDPAddr.IP.Equal(want.IP) || path.qntUDPAddr.Port != want.Port {
+		t.Fatalf("cached QNT addr = %v, want %v", path.qntUDPAddr, want)
 	}
 }
 

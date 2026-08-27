@@ -115,3 +115,14 @@ func (b recvBatch) release() {
 		b.releaseFn()
 	}
 }
+
+// recvAddr returns the transport address the batch arrived from. The IP
+// transport reports its source in ip rather than in info, so a batch carrying
+// a valid ip is an IP-path datagram; only relay and custom transports fill in
+// info.Remote.
+func (b recvBatch) recvAddr() Addr {
+	if b.ip.IsValid() {
+		return Addr{kind: AddrIP, ip: b.ip}
+	}
+	return b.info.Remote
+}

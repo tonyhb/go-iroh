@@ -31,12 +31,7 @@ func TestBlobTransferIroh(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return blobs.ServeBlob(ctx, s, blobs.StoreFunc(func(got blobs.Hash) ([]byte, bool) {
-				if got != hash {
-					return nil, false
-				}
-				return append([]byte(nil), data...), true
-			}))
+			return blobs.ServeBlob(ctx, s, mustBlobStore(t, data))
 		}),
 	}, nil)
 	if err != nil {
@@ -88,12 +83,7 @@ func TestDownloadBlobIrohStreamsLargeBlob(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return blobs.ServeBlob(ctx, s, blobs.StoreFunc(func(got blobs.Hash) ([]byte, bool) {
-				if got != hash {
-					return nil, false
-				}
-				return append([]byte(nil), data...), true
-			}))
+			return blobs.ServeBlob(ctx, s, mustBlobStore(t, data))
 		}),
 	}, nil)
 	if err != nil {
@@ -393,10 +383,7 @@ func TestGetManyBlobTransferIroh(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return blobs.ServeBlob(ctx, s, blobs.StoreFunc(func(hash blobs.Hash) ([]byte, bool) {
-				b, ok := store[hash]
-				return append([]byte(nil), b...), ok
-			}))
+			return blobs.ServeBlob(ctx, s, mustBlobStore(t, blobValues(store)...))
 		}),
 	}, nil)
 	if err != nil {
@@ -464,10 +451,7 @@ func TestGetHashSequenceBytesIroh(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return blobs.ServeBlob(ctx, s, blobs.StoreFunc(func(hash blobs.Hash) ([]byte, bool) {
-				b, ok := store[hash]
-				return append([]byte(nil), b...), ok
-			}))
+			return blobs.ServeBlob(ctx, s, mustBlobStore(t, blobValues(store)...))
 		}),
 	}, nil)
 	if err != nil {
@@ -564,4 +548,22 @@ func (w *writerAt) Bytes() []byte {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]byte(nil), w.b...)
+}
+
+// mustBlobStore returns an in-memory blob store holding data.
+func mustBlobStore(t *testing.T, data ...[]byte) *blobs.MemStore {
+	t.Helper()
+	m, err := blobs.NewMemStore(data...)
+	if err != nil {
+		t.Fatalf("NewMemStore: %v", err)
+	}
+	return m
+}
+
+func blobValues(m map[blobs.Hash][]byte) [][]byte {
+	out := make([][]byte, 0, len(m))
+	for _, v := range m {
+		out = append(out, v)
+	}
+	return out
 }

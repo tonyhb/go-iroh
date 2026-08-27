@@ -41,6 +41,7 @@ func (c *fakeRelayClient) Send(ctx context.Context, msg relayproto.ClientToRelay
 		case <-c.done:
 		}
 	}
+	msg.Datagrams.Contents = bytes.Clone(msg.Datagrams.Contents)
 	select {
 	case c.sent <- msg:
 		return nil
@@ -264,7 +265,9 @@ func TestActorBatching(t *testing.T) {
 		select {
 		case msg := <-client.sent:
 			if msg.Type == relayproto.FrameClientToRelayDatagram || msg.Type == relayproto.FrameClientToRelayDatagramBat {
-				got[string(msg.Datagrams.Contents)] = true
+				for _, seg := range splitSegments(msg.Datagrams) {
+					got[string(seg)] = true
+				}
 			}
 		case <-deadline:
 			t.Fatalf("got %d/%d datagrams", len(got), n)
@@ -411,5 +414,60 @@ func TestRemoveHomeRelayPromotesOneSuccessor(t *testing.T) {
 	}
 	if cActive {
 		t.Error("relay c was activated; only the promoted home may be started")
+	}
+}
+
+// TestRelayRateLimitedCounted verifies a Status frame carrying RateLimited
+// increments the rate-limited counter, and other statuses do not.
+func TestRelayRateLimitedCounted(t *testing.T) {
+	sk, _ := key.GenerateSecretKey()
+	a := NewRelayActor(RelayActorConfig{SecretKey: sk})
+	var m Metrics
+	a.setMetrics(&m)
+	r := newActiveRelay(a, testURL(t), false)
+	st := &connectedState{}
+
+	r.handleFrameAt(relayproto.RelayToClientMsg{Type: relayproto.FrameStatus, Status: relayproto.StatusHealthy}, st, time.Now())
+	if got := m.relayRateLimited.Load(); got != 0 {
+		t.Fatalf("rateLimited after Healthy = %d, want 0", got)
+	}
+	r.handleFrameAt(relayproto.RelayToClientMsg{Type: relayproto.FrameStatus, Status: relayproto.StatusRateLimited}, st, time.Now())
+	if got := m.relayRateLimited.Load(); got != 1 {
+		t.Fatalf("rateLimited after RateLimited = %d, want 1", got)
+	}
+}
+
+func TestRelayTransportSendBatch(t *testing.T) {
+	client := newFakeRelayClient()
+	a, _ := startActorWith(t, client)
+	sock := NewSocket()
+	rt := NewRelayTransport(sock, a, make(chan recvBatch, 8))
+	url := testURL(t)
+	peer, _ := key.GenerateSecretKey()
+	a.SetHomeRelay(url)
+	m := sock.RelayMappedAddrFor(url, peer.Public().EndpointID())
+
+	const seg = 1200
+	n := maxRelayBatch/seg*seg + seg + 100
+	p := make([]byte, n)
+	for i := range p {
+		p[i] = byte(i / seg)
+	}
+	if !rt.SendBatch(m, p, seg) {
+		t.Fatal("SendBatch returned false")
+	}
+	var got []byte
+	for len(got) < n {
+		msg := waitDatagramSend(t, client)
+		if len(msg.Datagrams.Contents) > seg && msg.Datagrams.SegmentSize != seg {
+			t.Fatalf("segment size = %d, want %d", msg.Datagrams.SegmentSize, seg)
+		}
+		if len(msg.Datagrams.Contents) > maxRelayBatch {
+			t.Fatalf("frame contents %d > %d", len(msg.Datagrams.Contents), maxRelayBatch)
+		}
+		got = append(got, msg.Datagrams.Contents...)
+	}
+	if !bytes.Equal(got, p) {
+		t.Fatal("reassembled payload differs")
 	}
 }

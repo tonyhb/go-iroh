@@ -1,4 +1,6 @@
 // Package dnsserver implements an embeddable iroh DNS and pkarr relay server.
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package dnsserver
 
 import (
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tmc/go-iroh/dns"
 	"github.com/tmc/go-iroh/key"
@@ -20,16 +23,27 @@ import (
 )
 
 const (
-	maxPacketSize = 64 * 1024
-	maxPUTSize    = 1024 * 1024
+	maxPacketSize    = 64 * 1024
+	maxPUTSize       = dns.MaxSignedPacketSize - key.PublicKeySize
+	maxStoredPackets = 10_000
+	packetRetention  = 7 * 24 * time.Hour
 )
+
+type storedPacket struct {
+	payload  []byte
+	packet   *dns.SignedPacket
+	storedAt time.Time
+}
 
 // Server stores pkarr relay payloads in memory and serves them over HTTP and
 // DNS. It is safe for concurrent use.
 type Server struct {
-	mu      sync.Mutex
-	store   map[string][]byte
-	metrics dnsMetrics
+	mu         sync.Mutex
+	store      map[string]storedPacket
+	maxPackets int
+	retention  time.Duration
+	now        func() time.Time
+	metrics    dnsMetrics
 }
 
 type dnsMetrics struct {
@@ -40,7 +54,12 @@ type dnsMetrics struct {
 
 // New returns an empty DNS server.
 func New() *Server {
-	return &Server{store: make(map[string][]byte)}
+	return &Server{
+		store:      make(map[string]storedPacket),
+		maxPackets: maxStoredPackets,
+		retention:  packetRetention,
+		now:        time.Now,
+	}
 }
 
 // Snapshot returns the server's counter snapshot for [metrics.Registry].
@@ -69,13 +88,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "packet too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		if _, err := packetFromRelayPayload(keyLabel, body); err != nil {
+		packet, err := packetFromRelayPayload(keyLabel, body)
+		if err != nil {
 			http.Error(w, "bad signed packet", http.StatusBadRequest)
 			return
 		}
-		s.mu.Lock()
-		s.store[keyLabel] = bytes.Clone(body)
-		s.mu.Unlock()
+		if !s.put(keyLabel, body, packet) {
+			http.Error(w, "stale signed packet", http.StatusConflict)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
 		s.metrics.httpGets.Add(1)
@@ -198,10 +219,63 @@ func (s *Server) lookupTXT(q dnsmessage.Question) ([]string, bool) {
 
 func (s *Server) get(keyLabel string) ([]byte, bool) {
 	s.mu.Lock()
-	body, ok := s.store[keyLabel]
-	body = bytes.Clone(body)
-	s.mu.Unlock()
-	return body, ok
+	defer s.mu.Unlock()
+	stored, ok := s.store[keyLabel]
+	if !ok {
+		return nil, false
+	}
+	if s.now().Sub(stored.storedAt) >= s.retention {
+		delete(s.store, keyLabel)
+		return nil, false
+	}
+	return bytes.Clone(stored.payload), true
+}
+
+func (s *Server) put(keyLabel string, payload []byte, packet *dns.SignedPacket) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	cutoff := now.Add(-s.retention).UnixMicro()
+	if cutoff > 0 && packet.TimestampMicros() < uint64(cutoff) {
+		return false
+	}
+	if old, ok := s.store[keyLabel]; ok {
+		if old.packet.MoreRecentThan(packet) {
+			return false
+		}
+		s.store[keyLabel] = storedPacket{bytes.Clone(payload), packet, now}
+		return true
+	}
+
+	s.evictExpired(now)
+	if len(s.store) >= s.maxPackets {
+		s.evictOldest()
+	}
+	s.store[keyLabel] = storedPacket{bytes.Clone(payload), packet, now}
+	return true
+}
+
+func (s *Server) evictExpired(now time.Time) {
+	for keyLabel, packet := range s.store {
+		if now.Sub(packet.storedAt) >= s.retention {
+			delete(s.store, keyLabel)
+		}
+	}
+}
+
+func (s *Server) evictOldest() {
+	var oldestKey string
+	var oldest time.Time
+	for keyLabel, packet := range s.store {
+		if oldestKey == "" || packet.storedAt.Before(oldest) || packet.storedAt.Equal(oldest) && keyLabel < oldestKey {
+			oldestKey = keyLabel
+			oldest = packet.storedAt
+		}
+	}
+	if oldestKey != "" {
+		delete(s.store, oldestKey)
+	}
 }
 
 func packetFromRelayPayload(keyLabel string, payload []byte) (*dns.SignedPacket, error) {

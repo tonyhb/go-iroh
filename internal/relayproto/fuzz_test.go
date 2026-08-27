@@ -1,6 +1,7 @@
 package relayproto
 
 import (
+	"encoding/base64"
 	"testing"
 	"time"
 
@@ -32,6 +33,46 @@ func FuzzParseRelayFrames(f *testing.F) {
 		_, _ = ParseClientToRelayMsg(data)
 		_, _ = ParseHandshakeFrame(data)
 	})
+}
+
+func FuzzKeyMaterialClientAuthHeader(f *testing.F) {
+	secret := fuzzSecretKey()
+	auth := KeyMaterialClientAuth{
+		PublicKey:         secret.Public(),
+		Signature:         key.NewSignature([key.SignatureSize]byte{1}),
+		KeyMaterialSuffix: [16]byte{2},
+	}
+	value, err := auth.HeaderValue()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add([]byte(value))
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		checkKeyMaterialClientAuthHeader(t, string(data))
+		checkKeyMaterialClientAuthHeader(t, base64.RawURLEncoding.EncodeToString(data))
+	})
+}
+
+func checkKeyMaterialClientAuthHeader(t *testing.T, value string) {
+	t.Helper()
+	auth, err := KeyMaterialClientAuthFromHeader(value)
+	if err != nil {
+		return
+	}
+	encoded, err := auth.HeaderValue()
+	if err != nil {
+		t.Fatalf("re-encode auth header: %v", err)
+	}
+	reparsed, err := KeyMaterialClientAuthFromHeader(encoded)
+	if err != nil {
+		t.Fatalf("reparse auth header: %v", err)
+	}
+	if !reparsed.PublicKey.Equal(auth.PublicKey) ||
+		reparsed.Signature != auth.Signature ||
+		reparsed.KeyMaterialSuffix != auth.KeyMaterialSuffix {
+		t.Fatal("auth header changed after reparse")
+	}
 }
 
 func fuzzSecretKey() key.SecretKey {

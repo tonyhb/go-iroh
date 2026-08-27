@@ -24,4 +24,6 @@
 //
 // This package wraps a fork of quic-go (internal/qng) that drives a vendored
 // crypto/tls with RFC 7250 support (internal/itls/tls).
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package iroh

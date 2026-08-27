@@ -157,37 +157,6 @@ func TestConnStats(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.conn.Stats()
-			want := tt.conn.qc.ConnectionStats()
-			if got.MinRTT != want.MinRTT {
-				t.Errorf("MinRTT = %v, want %v", got.MinRTT, want.MinRTT)
-			}
-			if got.LatestRTT != want.LatestRTT {
-				t.Errorf("LatestRTT = %v, want %v", got.LatestRTT, want.LatestRTT)
-			}
-			if got.SmoothedRTT != want.SmoothedRTT {
-				t.Errorf("SmoothedRTT = %v, want %v", got.SmoothedRTT, want.SmoothedRTT)
-			}
-			if got.MeanDeviation != want.MeanDeviation {
-				t.Errorf("MeanDeviation = %v, want %v", got.MeanDeviation, want.MeanDeviation)
-			}
-			if got.BytesSent != want.BytesSent {
-				t.Errorf("BytesSent = %d, want %d", got.BytesSent, want.BytesSent)
-			}
-			if got.PacketsSent != want.PacketsSent {
-				t.Errorf("PacketsSent = %d, want %d", got.PacketsSent, want.PacketsSent)
-			}
-			if got.BytesReceived != want.BytesReceived {
-				t.Errorf("BytesReceived = %d, want %d", got.BytesReceived, want.BytesReceived)
-			}
-			if got.PacketsReceived != want.PacketsReceived {
-				t.Errorf("PacketsReceived = %d, want %d", got.PacketsReceived, want.PacketsReceived)
-			}
-			if got.BytesLost != want.BytesLost {
-				t.Errorf("BytesLost = %d, want %d", got.BytesLost, want.BytesLost)
-			}
-			if got.PacketsLost != want.PacketsLost {
-				t.Errorf("PacketsLost = %d, want %d", got.PacketsLost, want.PacketsLost)
-			}
 			if got.BytesSent == 0 {
 				t.Error("BytesSent = 0, want traffic recorded")
 			}
@@ -195,6 +164,36 @@ func TestConnStats(t *testing.T) {
 				t.Error("BytesReceived = 0, want traffic recorded")
 			}
 		})
+	}
+}
+
+func TestConnStatsMapping(t *testing.T) {
+	want := ConnStats{
+		MinRTT:          time.Millisecond,
+		LatestRTT:       2 * time.Millisecond,
+		SmoothedRTT:     3 * time.Millisecond,
+		MeanDeviation:   4 * time.Millisecond,
+		BytesSent:       5,
+		PacketsSent:     6,
+		BytesReceived:   7,
+		PacketsReceived: 8,
+		BytesLost:       9,
+		PacketsLost:     10,
+	}
+	got := connStats(quic.ConnectionStats{
+		MinRTT:          want.MinRTT,
+		LatestRTT:       want.LatestRTT,
+		SmoothedRTT:     want.SmoothedRTT,
+		MeanDeviation:   want.MeanDeviation,
+		BytesSent:       want.BytesSent,
+		PacketsSent:     want.PacketsSent,
+		BytesReceived:   want.BytesReceived,
+		PacketsReceived: want.PacketsReceived,
+		BytesLost:       want.BytesLost,
+		PacketsLost:     want.PacketsLost,
+	})
+	if got != want {
+		t.Fatalf("connStats() = %+v, want %+v", got, want)
 	}
 }
 
@@ -860,12 +859,6 @@ func TestConnMaxDatagramSize(t *testing.T) {
 	if string(got) != string(msg) {
 		t.Fatalf("server datagram = %x, want %x", got, msg)
 	}
-}
-
-func clientStableIDCount(e *Endpoint) int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return len(e.stableIDs)
 }
 
 // ExampleConn_Stats prints whether a loopback connection has recorded traffic.

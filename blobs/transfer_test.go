@@ -16,13 +16,7 @@ func TestSingleLeafTransfer(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeSingleLeaf(context.Background(), server, SingleLeafStoreFunc(func(got Hash) ([]byte, bool) {
-			if got != hash {
-				t.Errorf("requested hash = %s, want %s", got, hash)
-				return nil, false
-			}
-			return append([]byte(nil), data...), true
-		}))
+		errc <- ServeSingleLeaf(context.Background(), server, mustStore(t, data))
 	}()
 	got, err := GetSingleLeaf(context.Background(), client, hash)
 	if err != nil {
@@ -42,13 +36,7 @@ func TestBlobTransfer(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(got Hash) ([]byte, bool) {
-			if got != hash {
-				t.Errorf("requested hash = %s, want %s", got, hash)
-				return nil, false
-			}
-			return append([]byte(nil), data...), true
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, data))
 	}()
 	got, err := GetBlobBytes(context.Background(), client, hash)
 	if err != nil {
@@ -68,13 +56,7 @@ func TestDownloadBlobStreamsToWriter(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(got Hash) ([]byte, bool) {
-			if got != hash {
-				t.Errorf("requested hash = %s, want %s", got, hash)
-				return nil, false
-			}
-			return append([]byte(nil), data...), true
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, data))
 	}()
 
 	var got bytes.Buffer
@@ -133,13 +115,7 @@ func TestBlobRangeTransfer(t *testing.T) {
 			client, server := newTestBidiStreamPair()
 			errc := make(chan error, 1)
 			go func() {
-				errc <- ServeBlob(context.Background(), server, StoreFunc(func(got Hash) ([]byte, bool) {
-					if got != hash {
-						t.Errorf("requested hash = %s, want %s", got, hash)
-						return nil, false
-					}
-					return append([]byte(nil), data...), true
-				}))
+				errc <- ServeBlob(context.Background(), server, mustStore(t, data))
 			}()
 			got, err := GetBlobRangeBytes(context.Background(), client, hash, tt.ranges, uint64(len(data)))
 			if err != nil {
@@ -283,9 +259,7 @@ func TestBlobRangeTransferRejectsDisjointRanges(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(Hash) ([]byte, bool) {
-			return append([]byte(nil), data...), true
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, data))
 	}()
 	ranges := ChunkRanges{ranges: []ChunkRange{{Start: 0, End: 1}, {Start: 3, End: 4}}}
 	if _, err := client.Write(EncodeGetRequestBytes(GetBlobRanges(hash, ranges))); err != nil {
@@ -305,13 +279,7 @@ func TestObserveTransfer(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(got Hash) ([]byte, bool) {
-			if got != hash {
-				t.Errorf("requested hash = %s, want %s", got, hash)
-				return nil, false
-			}
-			return append([]byte(nil), data...), true
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, data))
 	}()
 
 	var got []Bitfield
@@ -353,10 +321,7 @@ func TestGetManyBlobTransfer(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(hash Hash) ([]byte, bool) {
-			b, ok := blobs[hash]
-			return append([]byte(nil), b...), ok
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, blobValues(blobs)...))
 	}()
 	got, err := GetManyBlobBytes(context.Background(), client, hashes)
 	if err != nil {
@@ -395,10 +360,7 @@ func TestGetHashSequenceBytes(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeBlob(context.Background(), server, StoreFunc(func(hash Hash) ([]byte, bool) {
-			b, ok := blobs[hash]
-			return append([]byte(nil), b...), ok
-		}))
+		errc <- ServeBlob(context.Background(), server, mustStore(t, blobValues(blobs)...))
 	}()
 	gotSeq, got, err := GetHashSequenceBytes(context.Background(), client, root)
 	if err != nil {
@@ -431,9 +393,7 @@ func TestServeSingleLeafErrors(t *testing.T) {
 	client, server := newTestBidiStreamPair()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- ServeSingleLeaf(context.Background(), server, SingleLeafStoreFunc(func(Hash) ([]byte, bool) {
-			return nil, false
-		}))
+		errc <- ServeSingleLeaf(context.Background(), server, mustStore(t))
 	}()
 	if _, err := client.Write(EncodeGetRequestBytes(GetBlob(hash))); err != nil {
 		t.Fatal(err)
@@ -448,9 +408,7 @@ func TestServeSingleLeafErrors(t *testing.T) {
 	client, server = newTestBidiStreamPair()
 	errc = make(chan error, 1)
 	go func() {
-		errc <- ServeSingleLeaf(context.Background(), server, SingleLeafStoreFunc(func(Hash) ([]byte, bool) {
-			return nil, false
-		}))
+		errc <- ServeSingleLeaf(context.Background(), server, mustStore(t))
 	}()
 	if _, err := client.Write(EncodeGetRequestBytes(GetAll(hash))); err != nil {
 		t.Fatal(err)
@@ -522,4 +480,22 @@ func (w *testWriterAt) Bytes() []byte {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]byte(nil), w.b...)
+}
+
+// mustStore returns an in-memory store holding data.
+func mustStore(t *testing.T, data ...[]byte) *MemStore {
+	t.Helper()
+	m, err := NewMemStore(data...)
+	if err != nil {
+		t.Fatalf("NewMemStore: %v", err)
+	}
+	return m
+}
+
+func blobValues(m map[Hash][]byte) [][]byte {
+	out := make([][]byte, 0, len(m))
+	for _, v := range m {
+		out = append(out, v)
+	}
+	return out
 }

@@ -63,10 +63,10 @@ func TestFSStoreGCSweepsUntaggedBlobs(t *testing.T) {
 	if result.Deleted != 1 {
 		t.Fatalf("GC deleted %d blobs, want 1", result.Deleted)
 	}
-	if _, ok := store.GetBlob(keep); !ok {
+	if _, err := ReadBlob(context.Background(), store, keep); err != nil {
 		t.Fatal("tagged blob was swept")
 	}
-	if _, ok := store.GetBlob(drop); ok {
+	if _, err := ReadBlob(context.Background(), store, drop); err == nil {
 		t.Fatal("untagged blob survived GC")
 	}
 }
@@ -139,7 +139,7 @@ func TestFSStoreGCRechecksTagsBeforeDelete(t *testing.T) {
 	if result.Deleted != 0 {
 		t.Fatalf("GCWithEvents deleted %d blobs, want 0", result.Deleted)
 	}
-	if _, ok := store.GetBlob(hash); !ok {
+	if _, err := ReadBlob(context.Background(), store, hash); err != nil {
 		t.Fatal("late-tagged blob was swept")
 	}
 }
@@ -160,7 +160,7 @@ func TestFSStoreTempTagProtectsBlob(t *testing.T) {
 	if _, err := store.GC(context.Background()); err != nil {
 		t.Fatalf("GC with temp tag: %v", err)
 	}
-	if _, ok := store.GetBlob(hash); !ok {
+	if _, err := ReadBlob(context.Background(), store, hash); err != nil {
 		t.Fatal("temp-tagged blob was swept")
 	}
 	if err := tag.Close(); err != nil {
@@ -169,7 +169,7 @@ func TestFSStoreTempTagProtectsBlob(t *testing.T) {
 	if _, err := store.GC(context.Background()); err != nil {
 		t.Fatalf("GC after temp tag close: %v", err)
 	}
-	if _, ok := store.GetBlob(hash); ok {
+	if _, err := ReadBlob(context.Background(), store, hash); err == nil {
 		t.Fatal("blob survived after temp tag close")
 	}
 }
@@ -198,13 +198,13 @@ func TestFSStoreGCMarksHashSeqChildren(t *testing.T) {
 	if _, err := store.GC(context.Background()); err != nil {
 		t.Fatalf("GC: %v", err)
 	}
-	if _, ok := store.GetBlob(root); !ok {
+	if _, err := ReadBlob(context.Background(), store, root); err != nil {
 		t.Fatal("hash seq root was swept")
 	}
-	if _, ok := store.GetBlob(child); !ok {
+	if _, err := ReadBlob(context.Background(), store, child); err != nil {
 		t.Fatal("hash seq child was swept")
 	}
-	if _, ok := store.GetBlob(drop); ok {
+	if _, err := ReadBlob(context.Background(), store, drop); err == nil {
 		t.Fatal("untagged blob survived GC")
 	}
 }

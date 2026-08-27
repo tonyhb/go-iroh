@@ -32,7 +32,6 @@ type ReceiveStream struct {
 
 	queuedStopSending   bool
 	queuedMaxStreamData bool
-	maxStreamDataFrame  wire.MaxStreamDataFrame
 
 	// Set once we read the io.EOF or the cancellation error.
 	// Note that for local cancellations, this doesn't necessarily mean that we know the final offset yet.
@@ -461,6 +460,13 @@ func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monot
 			return nil
 		}
 		if s.currentFrameIsLast {
+			// The FIN arrived with no new readable bytes (a bare or duplicate
+			// FIN, retransmitted after the reader drained the stream and
+			// parked). Mark the read side finished like every other EOF site:
+			// isNewlyCompleted gates on errorRead, and without it the stream
+			// never reports completion, never returns its MAX_STREAMS credit,
+			// and the peer's OpenStreamSync eventually stalls forever.
+			s.errorRead = true
 			s.pendingReadErr = io.EOF
 			s.pendingReadReady = true
 			s.signalRead()
@@ -562,10 +568,15 @@ func (s *ReceiveStream) getControlFrame(now monotime.Time) (_ ackhandler.Frame, 
 	}
 
 	s.queuedMaxStreamData = false
-	s.maxStreamDataFrame.StreamID = s.streamID
-	s.maxStreamDataFrame.MaximumStreamData = s.flowController.GetWindowUpdate(now)
+	// Allocate a fresh frame: the retransmission queue retains the pointer on
+	// loss, so a reused struct would mutate under it and could rewrite an
+	// already-committed window grant (GetWindowUpdate advances the window
+	// before the frame is sent, and returns 0 after the final offset).
 	return ackhandler.Frame{
-		Frame: &s.maxStreamDataFrame,
+		Frame: &wire.MaxStreamDataFrame{
+			StreamID:          s.streamID,
+			MaximumStreamData: s.flowController.GetWindowUpdate(now),
+		},
 	}, true, false
 }
 

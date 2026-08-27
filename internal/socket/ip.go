@@ -60,6 +60,7 @@ func (t *IpTransport) Serve(ctx context.Context) {
 			// Timeout or platform quirk; nothing to deliver.
 			continue
 		}
+		recordUDPReceive(1, false)
 		// The transport address is internal to iroh and is always the canonical
 		// (unmapped) form. iroh/src/socket/transports/ip.rs:219.
 		cap := canonicalAddrPort(ap)

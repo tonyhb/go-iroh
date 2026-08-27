@@ -5,6 +5,8 @@
 // exposes the current value, a one-shot wait for the next change, and an
 // iterator stream of values. The root package uses Observer for APIs such as
 // Endpoint.WatchAddr.
+//
+// The Go API is not stable before v1 and may change in any v0 release.
 package watch
 
 import (

@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -131,6 +132,17 @@ func (s *Stream) Peek(b []byte) (int, error) {
 // If the stream was canceled, the error is a [StreamError].
 func (s *Stream) Write(p []byte) (int, error) {
 	return s.sendStr.Write(p)
+}
+
+// ReadFrom implements [io.ReaderFrom]. See [SendStream.ReadFrom].
+func (s *Stream) ReadFrom(r io.Reader) (int64, error) {
+	return s.sendStr.ReadFrom(r)
+}
+
+// Writev writes the buffers in order as one write episode.
+// See [SendStream.Writev].
+func (s *Stream) Writev(bufs *net.Buffers) (int64, error) {
+	return s.sendStr.Writev(bufs)
 }
 
 // SetReliableBoundary marks the data written to this stream so far as reliable.

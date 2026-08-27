@@ -380,10 +380,7 @@ func hostName(id key.EndpointID) string {
 
 func infoFromAnnouncement(a announcementData) dns.EndpointInfo {
 	data := dns.NewEndpointData()
-	var addrs []netip.AddrPort
-	for _, ip := range a.ips {
-		addrs = append(addrs, ip)
-	}
+	addrs := append([]netip.AddrPort(nil), a.ips...)
 	data.AddIPAddrs(addrs...)
 	if a.relay != "" {
 		if relay, err := netaddr.ParseRelayURL(a.relay); err == nil {

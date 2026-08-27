@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -58,6 +59,9 @@ type Client struct {
 	conn    *websocket.Conn
 	version relayproto.ProtocolVersion
 	url     netaddr.RelayURL
+	rd      relayproto.FrameReader
+	wmu     sync.Mutex
+	wbuf    []byte
 }
 
 // Connect dials the relay at u and completes the protocol handshake.
@@ -152,16 +156,27 @@ func (c *Client) Version() relayproto.ProtocolVersion { return c.version }
 
 // Send sends a client-to-relay message.
 func (c *Client) Send(ctx context.Context, msg relayproto.ClientToRelayMsg) error {
-	return c.conn.Write(ctx, websocket.MessageBinary, msg.AppendTo(nil))
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.wbuf = msg.AppendTo(c.wbuf[:0])
+	return c.conn.Write(ctx, websocket.MessageBinary, c.wbuf)
 }
 
 // Recv receives the next relay-to-client message.
 func (c *Client) Recv(ctx context.Context) (relayproto.RelayToClientMsg, error) {
-	_, data, err := c.conn.Read(ctx)
+	data, err := c.rd.Read(ctx, c.conn)
 	if err != nil {
 		return relayproto.RelayToClientMsg{}, err
 	}
-	return relayproto.ParseRelayToClientMsgNoCopy(data, c.version)
+	msg, err := relayproto.ParseRelayToClientMsgNoCopy(data, c.version)
+	if err != nil {
+		return msg, err
+	}
+	// rd reuses its buffer and datagrams outlive this call.
+	if msg.Type == relayproto.FrameRelayToClientDatagram || msg.Type == relayproto.FrameRelayToClientDatagramBat {
+		msg.Datagrams = msg.Datagrams.Pooled()
+	}
+	return msg, nil
 }
 
 // Close closes the relay connection.

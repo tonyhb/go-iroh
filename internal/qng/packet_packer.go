@@ -136,6 +136,7 @@ type sealingManager interface {
 type frameSource interface {
 	HasData() bool
 	Append([]ackhandler.Frame, []ackhandler.StreamFrame, protocol.ByteCount, monotime.Time, protocol.Version) ([]ackhandler.Frame, ackhandler.StreamFrame, bool, []ackhandler.StreamFrame, protocol.ByteCount)
+	AppendControlFrames([]ackhandler.Frame, protocol.ByteCount, monotime.Time, protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)
 }
 
 type ackFrameSource interface {
@@ -741,11 +742,46 @@ func (p *packetPacker) composeNextPacket(
 	v protocol.Version,
 ) payload {
 	if onlyAck {
+		// "Ack-only" packets still carry control frames (window updates,
+		// retransmitted control frames), just no stream data or datagrams.
+		// A receiver in SendAck/SendPacingLimited is often a pure sink whose
+		// cwnd never grows; if it cannot send MAX_DATA / MAX_STREAM_DATA (or
+		// retransmit a lost one) it starves its sender of flow-control
+		// credit and the connection deadlocks. quinn behaves the same way.
+		var pl payload
 		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, true); ack != nil {
 			ack.Truncate(maxPayloadSize, v)
-			return payload{ack: ack, length: ack.Length(v)}
+			pl.ack = ack
+			pl.length += ack.Length(v)
 		}
-		return payload{}
+		for p.retransmissionQueue.HasData(protocol.Encryption1RTT) {
+			remainingLen := maxPayloadSize - pl.length
+			if remainingLen < protocol.MinStreamFrameSize {
+				break
+			}
+			f := p.retransmissionQueue.GetFrame(protocol.Encryption1RTT, remainingLen, v)
+			if f == nil {
+				break
+			}
+			pl.frames = append(pl.frames, ackhandler.Frame{Frame: f, Handler: p.retransmissionQueue.AckHandler(protocol.Encryption1RTT)})
+			pl.length += f.Length(v)
+		}
+		startLen := len(pl.frames)
+		var lengthAdded protocol.ByteCount
+		pl.frames, lengthAdded = p.framer.AppendControlFrames(pl.frames, maxPayloadSize-pl.length, now, v)
+		pl.length += lengthAdded
+		for i := startLen; i < len(pl.frames); i++ {
+			if pl.frames[i].Handler != nil {
+				continue
+			}
+			switch pl.frames[i].Frame.(type) {
+			case *wire.PathChallengeFrame, *wire.PathResponseFrame:
+				// PATH_CHALLENGE and PATH_RESPONSE are never retransmitted.
+			default:
+				pl.frames[i].Handler = p.retransmissionQueue.AckHandler(protocol.Encryption1RTT)
+			}
+		}
+		return pl
 	}
 
 	hasData := p.framer.HasData()

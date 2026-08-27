@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Pinned to a patched patch release: go1.26.5 carries five stdlib
+          # advisories that govulncheck reports against this tree. go.mod keeps
+          # its plain 'go 1.26' language floor so consumers choose their own
+          # toolchain; only what CI builds and scans is pinned here.
+          go-version: '1.26.6'
+          cache-dependency-path: go.sum
+      - name: Configure UDP buffers
+        run: |
+          sudo sysctl -w net.core.rmem_max=7500000
+          sudo sysctl -w net.core.wmem_max=7500000
+      - name: Build and test main module
+        run: |
+          go build ./...
+          go test ./...
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Pinned to a patched patch release: go1.26.5 carries five stdlib
+          # advisories that govulncheck reports against this tree. go.mod keeps
+          # its plain 'go 1.26' language floor so consumers choose their own
+          # toolchain; only what CI builds and scans is pinned here.
+          go-version: '1.26.6'
+          cache-dependency-path: go.sum
+      - name: Install analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - name: Check formatting
+        run: |
+          unformatted=$(git ls-files '*.go' ':!:internal/itls/tls/**' | xargs gofmt -l)
+          test -z "$unformatted" || {
+            printf 'unformatted Go files:\n%s\n' "$unformatted" >&2
+            exit 1
+          }
+      - name: Check package documentation
+        run: |
+          missing=$(go list -e -f '{{if not .Doc}}{{.ImportPath}}{{end}}' ./... |
+            awk 'NF && $0 !~ /\/internal(\/|$)/ && $0 !~ /\/cmd(\/|$)/')
+          test -z "$missing" || {
+            printf 'public packages without package documentation:\n%s\n' "$missing" >&2
+            exit 1
+          }
+      - name: Check module files
+        run: |
+          go mod tidy -diff
+          go mod verify
+      - name: Run static analysis
+        run: |
+          go vet ./...
+          staticcheck ./...
+          govulncheck ./...
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: 0
+        run: go build ./...
+      - name: Configure UDP buffers
+        run: |
+          sudo sysctl -w net.core.rmem_max=7500000
+          sudo sysctl -w net.core.wmem_max=7500000
+      - name: Run tests with race detector
+        run: go test -race -count=1 ./...

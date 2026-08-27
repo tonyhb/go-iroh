@@ -65,6 +65,12 @@ func NewPublicKey(b [PublicKeySize]byte) (PublicKey, error) {
 	return PublicKey{bytes: b}, nil
 }
 
+// UncheckedEndpointID skips curve-point validation; b must have passed
+// [NewEndpointID] before.
+func UncheckedEndpointID(b [PublicKeySize]byte) EndpointID {
+	return EndpointID(PublicKey{bytes: b})
+}
+
 // NewEndpointID constructs an EndpointID from a 32-byte array.
 func NewEndpointID(b [PublicKeySize]byte) (EndpointID, error) {
 	k, err := NewPublicKey(b)

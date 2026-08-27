@@ -27,30 +27,11 @@ type BidiStream interface {
 // AcceptBlobStream accepts the next bidirectional stream from a blob client.
 type AcceptBlobStream func(context.Context) (BidiStream, error)
 
-// Store stores raw blobs.
-type Store interface {
-	GetBlob(Hash) ([]byte, bool)
-}
-
-// StoreFunc adapts a function to [Store].
-type StoreFunc func(Hash) ([]byte, bool)
-
-// GetBlob calls f(hash).
-func (f StoreFunc) GetBlob(hash Hash) ([]byte, bool) { return f(hash) }
-
-// SingleLeafStore stores raw blobs.
-//
-// Deprecated: use [Store].
-type SingleLeafStore = Store
-
-// SingleLeafStoreFunc adapts a function to [SingleLeafStore].
-//
-// Deprecated: use [StoreFunc].
-type SingleLeafStoreFunc = StoreFunc
-
 var (
 	// ErrBlobNotFound is returned when a requested blob is not in a store.
 	ErrBlobNotFound = errors.New("blobs: blob not found")
+	// ErrStoreReadOnly is returned when a store cannot accept new blobs.
+	ErrStoreReadOnly = errors.New("blobs: store cannot add content")
 	// ErrUnsupportedRequest is returned when a request is outside the
 	// raw-blob transfer subset.
 	ErrUnsupportedRequest = errors.New("blobs: unsupported request")
@@ -62,7 +43,7 @@ var (
 // ServeBlob writes the full-range BAO response, or the hash-sequence root and
 // children for [GetAll], and closes its send side.
 func ServeBlob(ctx context.Context, s BidiStream, store Store) error {
-	return serveBlob(ctx, s, store, EncodeBlob, true)
+	return serveBlob(ctx, s, store, false, true)
 }
 
 // ServeBlobStreams serves blob requests from streams accepted by accept.
@@ -113,10 +94,10 @@ func ServeBlobStreams(ctx context.Context, accept AcceptBlobStream, store Store)
 // send side. ServeSingleLeaf writes the single-leaf BAO response and closes its
 // send side. Blobs larger than [MaxSingleLeafSize] are rejected.
 func ServeSingleLeaf(ctx context.Context, s BidiStream, store Store) error {
-	return serveBlob(ctx, s, store, EncodeSingleLeaf, false)
+	return serveBlob(ctx, s, store, true, false)
 }
 
-func serveBlob(ctx context.Context, s BidiStream, store Store, encode func([]byte) (Hash, []byte, error), hashSeq bool) error {
+func serveBlob(ctx context.Context, s BidiStream, store Store, singleLeaf, hashSeq bool) error {
 	if store == nil {
 		return errors.New("blobs: nil blob store")
 	}
@@ -140,7 +121,7 @@ func serveBlob(ctx context.Context, s BidiStream, store Store, encode func([]byt
 			_ = s.Close()
 			return ErrUnsupportedRequest
 		}
-		if err := writeGet(ctx, s, store, *req.Get, encode); err != nil {
+		if err := writeGet(ctx, s, store, *req.Get, singleLeaf); err != nil {
 			_ = s.Close()
 			return err
 		}
@@ -158,7 +139,7 @@ func serveBlob(ctx context.Context, s BidiStream, store Store, encode func([]byt
 				_ = s.Close()
 				return ErrUnsupportedRequest
 			}
-			if err := writeBlob(s, store, hash, encode); err != nil {
+			if err := writeBlob(ctx, s, store, hash, singleLeaf); err != nil {
 				_ = s.Close()
 				return err
 			}
@@ -168,7 +149,7 @@ func serveBlob(ctx context.Context, s BidiStream, store Store, encode func([]byt
 			_ = s.Close()
 			return ErrUnsupportedRequest
 		}
-		if err := writeObserve(s, store, *req.Observe); err != nil {
+		if err := writeObserve(ctx, s, store, *req.Observe); err != nil {
 			_ = s.Close()
 			return err
 		}
@@ -179,114 +160,113 @@ func serveBlob(ctx context.Context, s BidiStream, store Store, encode func([]byt
 	return closeWrite(s)
 }
 
-func writeObserve(s io.Writer, store Store, req ObserveRequest) error {
-	data, ok := store.GetBlob(req.Hash)
-	if !ok {
+func writeObserve(ctx context.Context, s io.Writer, store Store, req ObserveRequest) error {
+	blob, err := store.Open(ctx, req.Hash)
+	if err != nil {
+		return err
+	}
+	size, verified := blob.Size()
+	if !blob.IsComplete() || !verified {
 		return ErrBlobNotFound
 	}
-	b := CompleteBitfield(uint64(len(data)))
+	b := CompleteBitfield(size)
 	if !req.Ranges.IsAll() {
-		b = NewBitfield(uint64(len(data)), req.Ranges.ChunkRanges())
+		b = NewBitfield(size, req.Ranges.ChunkRanges())
 	}
 	return writeObserveItem(s, b)
 }
 
-func writeGet(ctx context.Context, s io.Writer, store Store, req GetRequest, encode func([]byte) (Hash, []byte, error)) error {
+func writeGet(ctx context.Context, s io.Writer, store Store, req GetRequest, singleLeaf bool) error {
 	if req.Ranges.IsBlob() {
-		return writeBlob(s, store, req.Hash, encode)
+		return writeBlob(ctx, s, store, req.Hash, singleLeaf)
 	}
 	if !req.Ranges.IsAll() {
 		return writeBlobRange(ctx, s, store, req.Hash, req.Ranges.At(0))
 	}
-	root, ok := store.GetBlob(req.Hash)
-	if !ok {
-		return ErrBlobNotFound
+	root, err := ReadBlob(ctx, store, req.Hash)
+	if err != nil {
+		return err
 	}
 	seq, err := ParseHashSequence(root)
 	if err != nil {
 		return fmt.Errorf("blobs: parse hash sequence: %w", err)
 	}
-	if err := writeBlobBytes(s, req.Hash, root, encode); err != nil {
+	if err := writeBlobBytes(s, req.Hash, root, encoderFor(singleLeaf)); err != nil {
 		return err
 	}
 	for _, hash := range seq.hashes {
-		if err := writeBlob(s, store, hash, encode); err != nil {
+		if err := writeBlob(ctx, s, store, hash, singleLeaf); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-type mapStore interface {
-	Get(context.Context, Hash) (MapEntry, bool, error)
+func encoderFor(singleLeaf bool) func([]byte) (Hash, []byte, error) {
+	if singleLeaf {
+		return EncodeSingleLeaf
+	}
+	return EncodeBlob
 }
 
-func writeBlobRange(ctx context.Context, s io.Writer, store Store, hash Hash, ranges ChunkRanges) error {
-	if m, ok := store.(mapStore); ok {
-		return writeBlobRangeFromMap(ctx, s, m, hash, ranges)
-	}
-	data, ok := store.GetBlob(hash)
-	if !ok {
-		return ErrBlobNotFound
-	}
-	offset, length, ok := singleByteRange(ranges, uint64(len(data)))
-	if !ok {
-		return ErrUnsupportedRequest
-	}
-	got, encoded, err := EncodeBlobRange(data, offset, length)
+// writeBlob streams the full-range BAO response for hash.
+//
+// A full-range response is byte-identical to a range response covering the
+// whole blob, so this shares the one streaming path with writeBlobRange and
+// never holds the blob in memory.
+func writeBlob(ctx context.Context, s io.Writer, store Store, hash Hash, singleLeaf bool) error {
+	blob, err := store.Open(ctx, hash)
 	if err != nil {
 		return err
 	}
-	if got != hash {
-		return fmt.Errorf("blobs: stored blob hash mismatch")
-	}
-	if _, err := s.Write(encoded); err != nil {
-		return fmt.Errorf("blobs: write response: %w", err)
-	}
-	return nil
-}
-
-func writeBlobRangeFromMap(ctx context.Context, s io.Writer, store mapStore, hash Hash, ranges ChunkRanges) error {
-	entry, ok, err := store.Get(ctx, hash)
-	if err != nil {
-		return fmt.Errorf("blobs: get blob: %w", err)
-	}
-	if !ok || !entry.IsComplete() {
+	size, verified := blob.Size()
+	if !blob.IsComplete() || !verified {
 		return ErrBlobNotFound
 	}
-	size, verified := entry.Size()
-	if !verified {
-		return ErrUnsupportedRequest
+	if singleLeaf && size > MaxSingleLeafSize {
+		return fmt.Errorf("%w: %d > %d", ErrSingleLeafTooLarge, size, MaxSingleLeafSize)
 	}
-	if size > maxInt64 {
-		return ErrUnsupportedRequest
+	return extractRange(ctx, s, blob, 0, size)
+}
+
+func writeBlobRange(ctx context.Context, s io.Writer, store Store, hash Hash, ranges ChunkRanges) error {
+	blob, err := store.Open(ctx, hash)
+	if err != nil {
+		return err
+	}
+	size, verified := blob.Size()
+	if !blob.IsComplete() || !verified {
+		return ErrBlobNotFound
 	}
 	offset, length, ok := singleByteRange(ranges, size)
 	if !ok {
 		return ErrUnsupportedRequest
 	}
-	data, err := entry.DataReader(ctx)
+	return extractRange(ctx, s, blob, offset, length)
+}
+
+// extractRange streams [offset, offset+length) of blob to s as a BAO slice.
+func extractRange(ctx context.Context, s io.Writer, blob Blob, offset, length uint64) error {
+	size, _ := blob.Size()
+	if size > maxInt64 {
+		return ErrUnsupportedRequest
+	}
+	data, err := blob.DataReader(ctx)
 	if err != nil {
 		return fmt.Errorf("blobs: open data: %w", err)
 	}
-	defer closeReaderAt(data)
-	outboard, err := entry.Outboard(ctx)
+	defer data.Close()
+	outboard, err := blob.Outboard(ctx)
 	if err != nil {
 		return fmt.Errorf("blobs: open outboard: %w", err)
 	}
-	defer closeReaderAt(outboard)
-	if outboard.Size() < 0 || outboard.Size() > int64(maxInt64) {
+	defer outboard.Close()
+	if outboard.Size() < 0 || uint64(outboard.Size()) > maxInt64 {
 		return ErrUnsupportedRequest
 	}
 	dataSection := io.NewSectionReader(data, 0, int64(size))
 	outboardSection := io.NewSectionReader(outboard, 0, outboard.Size())
 	return ExtractBlobRange(s, dataSection, outboardSection, offset, length)
-}
-
-func closeReaderAt(r io.ReaderAt) {
-	if c, ok := r.(io.Closer); ok {
-		_ = c.Close()
-	}
 }
 
 func checkedAdd(a, b uint64) (uint64, bool) {
@@ -295,14 +275,6 @@ func checkedAdd(a, b uint64) (uint64, bool) {
 }
 
 const maxInt64 = uint64(1<<63 - 1)
-
-func writeBlob(s io.Writer, store Store, hash Hash, encode func([]byte) (Hash, []byte, error)) error {
-	data, ok := store.GetBlob(hash)
-	if !ok {
-		return ErrBlobNotFound
-	}
-	return writeBlobBytes(s, hash, data, encode)
-}
 
 func writeBlobBytes(s io.Writer, hash Hash, data []byte, encode func([]byte) (Hash, []byte, error)) error {
 	got, encoded, err := encode(data)

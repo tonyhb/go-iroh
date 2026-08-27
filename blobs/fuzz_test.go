@@ -48,6 +48,18 @@ func FuzzDecodeRequestBytes(f *testing.F) {
 	})
 }
 
+func FuzzReadObserveItem(f *testing.F) {
+	var valid []byte
+	if err := writeObserveItem(bytesBuffer{&valid}, CompleteBitfield(1234)); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(valid)
+	f.Add(impossibleObserveItem())
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = readObserveItem(newByteReader(data))
+	})
+}
+
 func ptr[T any](v T) *T { return &v }
 
 func testHash() Hash {

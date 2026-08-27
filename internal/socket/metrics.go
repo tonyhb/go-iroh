@@ -17,6 +17,7 @@ type Metrics struct {
 	customRecv                  atomic.Uint64
 	recvDatagrams               atomic.Uint64
 	relayHomeChange             atomic.Uint64
+	relayRateLimited            atomic.Uint64
 	holepunchAttempts           atomic.Uint64
 	pathsDirect                 atomic.Uint64
 	pathsRelay                  atomic.Uint64
@@ -48,6 +49,7 @@ type MetricsSnapshot struct {
 	CustomRecv                  uint64
 	RecvDatagrams               uint64
 	RelayHomeChange             uint64
+	RelayRateLimited            uint64
 	HolepunchAttempts           uint64
 	PathsDirect                 uint64
 	PathsRelay                  uint64
@@ -82,6 +84,7 @@ func (m *Metrics) snapshot() MetricsSnapshot {
 		CustomRecv:                  m.customRecv.Load(),
 		RecvDatagrams:               m.recvDatagrams.Load(),
 		RelayHomeChange:             m.relayHomeChange.Load(),
+		RelayRateLimited:            m.relayRateLimited.Load(),
 		HolepunchAttempts:           m.holepunchAttempts.Load(),
 		PathsDirect:                 m.pathsDirect.Load(),
 		PathsRelay:                  m.pathsRelay.Load(),

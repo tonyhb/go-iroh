@@ -269,14 +269,6 @@ func (e EndpointInfo) ToSignedPacket(secretKey key.SecretKey, ttl uint32) (*Sign
 	return signedPacketFromInternal(packet), nil
 }
 
-// ToPkarrSignedPacket builds a pkarr signed packet for this endpoint info,
-// signed with secretKey and using the given record TTL in seconds.
-//
-// Deprecated: use [EndpointInfo.ToSignedPacket].
-func (e EndpointInfo) ToPkarrSignedPacket(secretKey key.SecretKey, ttl uint32) (*SignedPacket, error) {
-	return e.ToSignedPacket(secretKey, ttl)
-}
-
 // EndpointInfoFromTXTLookup parses an EndpointInfo from DNS TXT lookup results.
 // domainName is the queried name ("_iroh.<z32>.<origin>") and values are the
 // TXT record string values.
@@ -295,12 +287,4 @@ func EndpointInfoFromSignedPacket(packet *SignedPacket) (EndpointInfo, error) {
 		return EndpointInfo{}, err
 	}
 	return endpointInfoFromAttrs(attrs), nil
-}
-
-// EndpointInfoFromPkarrSignedPacket parses an EndpointInfo from a pkarr signed
-// packet.
-//
-// Deprecated: use [EndpointInfoFromSignedPacket].
-func EndpointInfoFromPkarrSignedPacket(packet *SignedPacket) (EndpointInfo, error) {
-	return EndpointInfoFromSignedPacket(packet)
 }

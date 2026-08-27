@@ -12,17 +12,13 @@ const ALPN = "/iroh-bytes/4"
 // RequestType identifies an iroh-blobs request variant.
 type RequestType uint64
 
+// Request types are the wire discriminants used by Rust iroh-blobs. Values
+// 2 through 7 are reserved by that numbering and have no Go name.
 const (
-	RequestGet RequestType = iota
-	RequestObserve
-	RequestSlot2
-	RequestSlot3
-	RequestSlot4
-	RequestSlot5
-	RequestSlot6
-	RequestSlot7
-	RequestPush
-	RequestGetMany
+	RequestGet     RequestType = 0
+	RequestObserve RequestType = 1
+	RequestPush    RequestType = 8
+	RequestGetMany RequestType = 9
 )
 
 // GetRequest requests a blob or hash sequence from a provider.

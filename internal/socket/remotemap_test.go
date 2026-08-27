@@ -385,6 +385,8 @@ func TestActorHeartbeatSyncsQNGRoutes(t *testing.T) {
 	})
 }
 
+// TestActorUpgradeTickStartsQNT asserts the upgrade tick punches while the
+// selected path is RELAYED — the state a punch can actually improve.
 func TestActorUpgradeTickStartsQNT(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -392,7 +394,7 @@ func TestActorUpgradeTickStartsQNT(t *testing.T) {
 		m := NewRemoteMap(ctx, BiasedRttPathSelector{}, nil)
 		id := testEndpointID(t)
 
-		conn := newFakeConn(IPAddr(netip.AddrPortFrom(netip.IPv6Loopback(), 9)), time.Millisecond)
+		conn := newFakeConn(relayPath(t, 1), time.Millisecond)
 		conn.multipathNegotiated = true
 		defer conn.Close()
 		events := m.AddConnection(id, conn)
@@ -421,6 +423,38 @@ func TestActorUpgradeTickStartsQNT(t *testing.T) {
 	})
 }
 
+// TestActorUpgradeTickSkipsDirectSelected: a direct-selected connection gets
+// no QNT round from the tick.
+func TestActorUpgradeTickSkipsDirectSelected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		m := NewRemoteMap(ctx, BiasedRttPathSelector{}, nil)
+		id := testEndpointID(t)
+
+		conn := newFakeConn(IPAddr(netip.AddrPortFrom(netip.IPv6Loopback(), 9)), time.Millisecond)
+		conn.multipathNegotiated = true
+		defer conn.Close()
+		events := m.AddConnection(id, conn)
+		eventsDone := make(chan struct{})
+		go func() {
+			for range events {
+			}
+			close(eventsDone)
+		}()
+		synctest.Wait()
+
+		time.Sleep(UpgradeInterval + time.Nanosecond)
+		synctest.Wait()
+		if got := conn.initiateRoundCalls.Load(); got != 0 {
+			t.Fatalf("InitiateNATTraversalRound calls on a direct-selected conn = %d, want 0", got)
+		}
+		cancel()
+		synctest.Wait()
+		<-eventsDone
+	})
+}
+
 // TestActorHolepunchGated asserts that hole-punching reports the negotiation
 // sentinel when no active connection has negotiated qng multipath/QNT.
 func TestActorHolepunchGated(t *testing.T) {
@@ -431,6 +465,36 @@ func TestActorHolepunchGated(t *testing.T) {
 	if err := a.TriggerHolepunch(); err != ErrExtensionNotNegotiated {
 		t.Errorf("TriggerHolepunch = %v, want ErrExtensionNotNegotiated", err)
 	}
+}
+
+func TestActorTriggerHolepunchConnUsesRequestedConnection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		m := NewRemoteMap(ctx, BiasedRttPathSelector{}, nil)
+		id := testEndpointID(t)
+
+		first := newFakeConn(IPAddr(netip.AddrPortFrom(netip.IPv6Loopback(), 9)), time.Millisecond)
+		first.multipathNegotiated = true
+		defer first.Close()
+		_, actor := m.AddConnectionActor(id, first)
+
+		second := newFakeConn(IPAddr(netip.AddrPortFrom(netip.IPv6Loopback(), 10)), time.Millisecond)
+		second.multipathNegotiated = true
+		defer second.Close()
+		m.AddConnection(id, second)
+		synctest.Wait()
+
+		if err := actor.TriggerHolepunchConn(second); err != nil {
+			t.Fatal(err)
+		}
+		if got := first.initiateRoundCalls.Load(); got != 0 {
+			t.Fatalf("first connection InitiateNATTraversalRound calls = %d, want 0", got)
+		}
+		if got := second.initiateRoundCalls.Load(); got != 1 {
+			t.Fatalf("second connection InitiateNATTraversalRound calls = %d, want 1", got)
+		}
+	})
 }
 
 // TestActorSendDatagramBlackhole asserts the blackhole invariant: SendDatagram
@@ -615,5 +679,14 @@ func TestRemoteMapRemoteInfo(t *testing.T) {
 	}
 	if info.Addrs[0].Usage != TransportAddrActive {
 		t.Fatalf("RemoteInfo usage = %v, want active", info.Addrs[0].Usage)
+	}
+}
+
+func TestDisableHolepunchPropagatesToActors(t *testing.T) {
+	m := NewRemoteMap(t.Context(), nil, nil)
+	m.DisableHolepunch()
+	a := m.Actor(key.EndpointID{})
+	if !a.noHolepunch.Load() {
+		t.Error("actor spawned after DisableHolepunch has noHolepunch unset; upgrade ticks would wedge relay-only streams")
 	}
 }
